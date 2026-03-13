@@ -1,0 +1,63 @@
+redis:
+  host: 127.0.0.1
+  port: 6379
+  db: 0
+
+storage:
+  base_dir: ./data
+  db_path: ./data/bbtrs.db
+
+dedup:
+  ttl: 86400  # 24 hours default
+
+streams:
+  scope_targets: "stream:scope:targets"
+  recon_subdomains: "stream:recon:subdomains"
+  recon_resolved: "stream:recon:resolved"
+  recon_ports: "stream:recon:ports"
+  recon_http: "stream:recon:http"
+  recon_urls: "stream:recon:urls"
+  recon_js: "stream:recon:js"
+  vuln_findings: "stream:vuln:findings"
+
+workers:
+  batch_size: 50
+  block_ms: 5000
+  max_retries: 3
+
+# Intigriti RoE compliance headers
+# IMPORTANT: Replace <username> with your Intigriti username
+intigriti:
+  username: "YOUR_USERNAME"
+  user_agent: "Intigriti-YOUR_USERNAME-Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/90.0.4430.212 Safari/537.36"
+  request_header: "X-Bug-Bounty: Intigriti-YOUR_USERNAME"
+  max_rps: 20  # Hard limit from Visma RoE
+
+tools:
+  subfinder:
+    threads: 10
+    timeout: 30
+  httpx:
+    threads: 5
+    rate_limit: 20  # Visma RoE: max 20 req/sec
+    timeout: 10
+    ports: "80,443,8080,8443,8000,3000,5000,9090"
+  nmap:
+    top_ports: 1000
+    rate: 20  # Visma RoE: max 20 req/sec
+    scripts: "default,vuln"
+  nuclei:
+    threads: 5
+    rate_limit: 20  # Visma RoE: max 20 req/sec
+    bulk_size: 5
+    template_dirs:
+      - "~/.local/nuclei-templates"
+    severity: "low,medium,high,critical"
+  katana:
+    depth: 3
+    threads: 5
+    rate_limit: 20  # Visma RoE: max 20 req/sec
+    timeout: 15
+  gowitness:
+    threads: 4
+    timeout: 10

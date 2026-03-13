@@ -1,0 +1,45 @@
+# Data & databases
+data/
+*.db
+*.sqlite
+*.sqlite3
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+.eggs/
+*.egg
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Docker volumes
+redis_data/
+
+# Sensitive
+*.env
+config/config.local.yml
+
+# Presentation (not part of the tool)
+*.pptx
+*.pdf
+
+# Claude
+.claude/
