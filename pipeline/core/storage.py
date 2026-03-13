@@ -118,7 +118,39 @@ class Storage:
                     evidence TEXT,
                     raw_json TEXT,
                     status TEXT DEFAULT 'new',
+                    cve_id TEXT,
+                    cvss_score REAL,
+                    false_positive INTEGER DEFAULT 0,
+                    dedup_hash TEXT,
                     discovered_at TEXT DEFAULT (datetime('now'))
+                );
+
+                CREATE TABLE IF NOT EXISTS cves (
+                    id TEXT PRIMARY KEY,
+                    cvss_score REAL,
+                    cvss_vector TEXT,
+                    severity TEXT,
+                    description TEXT,
+                    published TEXT,
+                    affected_product TEXT,
+                    affected_versions TEXT,
+                    references_json TEXT,
+                    updated_at TEXT DEFAULT (datetime('now'))
+                );
+
+                CREATE TABLE IF NOT EXISTS finding_cves (
+                    finding_id INTEGER REFERENCES findings(id),
+                    cve_id TEXT REFERENCES cves(id),
+                    confidence TEXT DEFAULT 'medium',
+                    PRIMARY KEY (finding_id, cve_id)
+                );
+
+                CREATE TABLE IF NOT EXISTS fp_rules (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    rule_type TEXT NOT NULL,
+                    pattern TEXT NOT NULL,
+                    reason TEXT,
+                    created_at TEXT DEFAULT (datetime('now'))
                 );
 
                 CREATE INDEX IF NOT EXISTS idx_subdomains_domain ON subdomains(domain);
@@ -126,7 +158,34 @@ class Storage:
                 CREATE INDEX IF NOT EXISTS idx_http_url ON http_services(url);
                 CREATE INDEX IF NOT EXISTS idx_findings_severity ON findings(severity);
                 CREATE INDEX IF NOT EXISTS idx_findings_status ON findings(status);
+                CREATE INDEX IF NOT EXISTS idx_cves_severity ON cves(severity);
             """)
+
+            # Migrate existing findings table if needed (add new columns)
+            cols = {r[1] for r in conn.execute("PRAGMA table_info(findings)").fetchall()}
+            migrations = {
+                "cve_id": "ALTER TABLE findings ADD COLUMN cve_id TEXT",
+                "cvss_score": "ALTER TABLE findings ADD COLUMN cvss_score REAL",
+                "false_positive": "ALTER TABLE findings ADD COLUMN false_positive INTEGER DEFAULT 0",
+                "dedup_hash": "ALTER TABLE findings ADD COLUMN dedup_hash TEXT",
+            }
+            for col, sql in migrations.items():
+                if col not in cols:
+                    try:
+                        conn.execute(sql)
+                    except sqlite3.OperationalError:
+                        pass
+
+            # Create indexes on potentially-migrated columns (safe after migration)
+            for idx_sql in [
+                "CREATE INDEX IF NOT EXISTS idx_findings_cve ON findings(cve_id)",
+                "CREATE INDEX IF NOT EXISTS idx_findings_dedup ON findings(dedup_hash)",
+                "CREATE INDEX IF NOT EXISTS idx_findings_fp ON findings(false_positive)",
+            ]:
+                try:
+                    conn.execute(idx_sql)
+                except sqlite3.OperationalError:
+                    pass
 
     def _conn(self) -> sqlite3.Connection:
         conn = sqlite3.connect(str(self.db_path))
@@ -303,10 +362,133 @@ class Storage:
             )
             return cur.lastrowid
 
-    def get_findings(self, program_id: int = None, severity: str = None, status: str = None) -> list[dict]:
+    def add_finding_deduped(self, program_id: int, dedup_hash: str, **kwargs) -> int | None:
+        """Add a finding only if the dedup_hash is new. Returns finding ID or None if duplicate."""
+        with self._conn() as conn:
+            existing = conn.execute(
+                "SELECT id FROM findings WHERE dedup_hash=? AND false_positive=0",
+                (dedup_hash,),
+            ).fetchone()
+            if existing:
+                return None
+
+            cur = conn.execute(
+                """INSERT INTO findings (program_id, subdomain_id, tool, template_id, severity,
+                   title, description, url, matched_at, evidence, raw_json, cve_id, cvss_score, dedup_hash)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    program_id,
+                    kwargs.get("subdomain_id"),
+                    kwargs.get("tool"),
+                    kwargs.get("template_id"),
+                    kwargs.get("severity"),
+                    kwargs.get("title"),
+                    kwargs.get("description"),
+                    kwargs.get("url"),
+                    kwargs.get("matched_at"),
+                    kwargs.get("evidence"),
+                    json.dumps(kwargs.get("raw")) if "raw" in kwargs else None,
+                    kwargs.get("cve_id"),
+                    kwargs.get("cvss_score"),
+                    dedup_hash,
+                ),
+            )
+            return cur.lastrowid
+
+    def update_finding(self, finding_id: int, **kwargs):
+        """Update finding fields."""
+        allowed = {"status", "severity", "cve_id", "cvss_score", "false_positive", "description"}
+        sets = []
+        params = []
+        for k, v in kwargs.items():
+            if k in allowed:
+                sets.append(f"{k}=?")
+                params.append(v)
+        if sets:
+            params.append(finding_id)
+            with self._conn() as conn:
+                conn.execute(f"UPDATE findings SET {', '.join(sets)} WHERE id=?", params)
+
+    # --- CVEs ---
+
+    def upsert_cve(self, cve_id: str, **kwargs):
+        """Store or update a CVE record."""
+        with self._conn() as conn:
+            conn.execute(
+                """INSERT INTO cves (id, cvss_score, cvss_vector, severity, description,
+                   published, affected_product, affected_versions, references_json, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
+                   ON CONFLICT(id) DO UPDATE SET
+                     cvss_score=COALESCE(excluded.cvss_score, cvss_score),
+                     cvss_vector=COALESCE(excluded.cvss_vector, cvss_vector),
+                     severity=COALESCE(excluded.severity, severity),
+                     description=COALESCE(excluded.description, description),
+                     affected_product=COALESCE(excluded.affected_product, affected_product),
+                     affected_versions=COALESCE(excluded.affected_versions, affected_versions),
+                     references_json=COALESCE(excluded.references_json, references_json),
+                     updated_at=datetime('now')""",
+                (
+                    cve_id,
+                    kwargs.get("cvss_score"),
+                    kwargs.get("cvss_vector"),
+                    kwargs.get("severity"),
+                    kwargs.get("description"),
+                    kwargs.get("published"),
+                    kwargs.get("affected_product"),
+                    kwargs.get("affected_versions"),
+                    json.dumps(kwargs["references"]) if "references" in kwargs else None,
+                ),
+            )
+
+    def link_finding_cve(self, finding_id: int, cve_id: str, confidence: str = "medium"):
+        with self._conn() as conn:
+            conn.execute(
+                "INSERT OR IGNORE INTO finding_cves (finding_id, cve_id, confidence) VALUES (?, ?, ?)",
+                (finding_id, cve_id, confidence),
+            )
+
+    def get_cve(self, cve_id: str) -> dict | None:
+        with self._conn() as conn:
+            row = conn.execute("SELECT * FROM cves WHERE id=?", (cve_id,)).fetchone()
+            return dict(row) if row else None
+
+    def get_finding_cves(self, finding_id: int) -> list[dict]:
+        with self._conn() as conn:
+            return [dict(r) for r in conn.execute(
+                """SELECT c.*, fc.confidence FROM cves c
+                   JOIN finding_cves fc ON c.id = fc.cve_id
+                   WHERE fc.finding_id=?""",
+                (finding_id,),
+            ).fetchall()]
+
+    # --- False Positive Rules ---
+
+    def add_fp_rule(self, rule_type: str, pattern: str, reason: str = None) -> int:
+        """Add a false positive filtering rule.
+        rule_type: 'template_id', 'title', 'url_pattern', 'severity'
+        """
+        with self._conn() as conn:
+            cur = conn.execute(
+                "INSERT INTO fp_rules (rule_type, pattern, reason) VALUES (?, ?, ?)",
+                (rule_type, pattern, reason),
+            )
+            return cur.lastrowid
+
+    def get_fp_rules(self) -> list[dict]:
+        with self._conn() as conn:
+            return [dict(r) for r in conn.execute("SELECT * FROM fp_rules").fetchall()]
+
+    def delete_fp_rule(self, rule_id: int):
+        with self._conn() as conn:
+            conn.execute("DELETE FROM fp_rules WHERE id=?", (rule_id,))
+
+    def get_findings(self, program_id: int = None, severity: str = None,
+                     status: str = None, include_fp: bool = False) -> list[dict]:
         with self._conn() as conn:
             query = "SELECT * FROM findings WHERE 1=1"
             params = []
+            if not include_fp:
+                query += " AND false_positive=0"
             if program_id:
                 query += " AND program_id=?"
                 params.append(program_id)
@@ -316,8 +498,19 @@ class Storage:
             if status:
                 query += " AND status=?"
                 params.append(status)
-            query += " ORDER BY discovered_at DESC"
-            return [dict(r) for r in conn.execute(query, params).fetchall()]
+            query += " ORDER BY cvss_score DESC NULLS LAST, discovered_at DESC"
+            findings = [dict(r) for r in conn.execute(query, params).fetchall()]
+
+            # Attach CVE data
+            for f in findings:
+                f["cves"] = [dict(r) for r in conn.execute(
+                    """SELECT c.id, c.cvss_score, c.severity, c.description
+                       FROM cves c JOIN finding_cves fc ON c.id=fc.cve_id
+                       WHERE fc.finding_id=?""",
+                    (f["id"],),
+                ).fetchall()]
+
+            return findings
 
     # --- Export for Claude Code analysis ---
 

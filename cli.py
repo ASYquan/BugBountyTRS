@@ -182,6 +182,8 @@ WORKERS = {
     "crawler": "pipeline.stages.crawler:CrawlerWorker",
     "js_analyze": "pipeline.stages.js_analyze:JSAnalyzeWorker",
     "nuclei": "pipeline.stages.nuclei_scan:NucleiScanWorker",
+    "cve_correlate": "pipeline.stages.cve_correlate:CVECorrelateWorker",
+    "finding_filter": "pipeline.stages.finding_filter:FindingFilterWorker",
 }
 
 
@@ -388,28 +390,35 @@ def list_findings(program, severity, status, limit):
         console.print("[yellow]No findings.[/yellow]")
         return
 
-    table = Table(title=f"Findings ({len(findings)} total)")
+    table = Table(title=f"Findings ({len(findings)} total, FPs hidden)")
     table.add_column("ID", style="dim")
     table.add_column("Severity")
+    table.add_column("CVSS", justify="right")
+    table.add_column("CVE")
     table.add_column("Tool")
-    table.add_column("Title", max_width=50)
-    table.add_column("URL", max_width=60)
+    table.add_column("Title", max_width=45)
+    table.add_column("URL", max_width=50)
     table.add_column("Status")
-    table.add_column("Date")
 
     sev_colors = {"critical": "red", "high": "bright_red", "medium": "yellow", "low": "blue", "info": "dim"}
 
     for f in findings[:limit]:
         sev = f.get("severity", "unknown")
         color = sev_colors.get(sev, "white")
+        cvss = f"{f['cvss_score']:.1f}" if f.get("cvss_score") else "-"
+        cve = f.get("cve_id") or "-"
+        # Also show linked CVEs
+        if not f.get("cve_id") and f.get("cves"):
+            cve = f["cves"][0]["id"]
         table.add_row(
             str(f["id"]),
             f"[{color}]{sev}[/{color}]",
+            cvss,
+            cve,
             f.get("tool", "?"),
             f.get("title", "?"),
             f.get("url", "?"),
             f.get("status", "new"),
-            f.get("discovered_at", "?"),
         )
 
     console.print(table)
@@ -427,13 +436,17 @@ def show_finding(finding_id):
         return
 
     f = dict(row)
+    cvss_str = f"{f['cvss_score']:.1f}" if f.get("cvss_score") else "N/A"
     panel_text = f"""[bold]Title:[/bold] {f.get('title', '?')}
 [bold]Severity:[/bold] {f.get('severity', '?')}
+[bold]CVE:[/bold] {f.get('cve_id', 'N/A')}
+[bold]CVSS:[/bold] {cvss_str}
 [bold]Tool:[/bold] {f.get('tool', '?')}
 [bold]Template:[/bold] {f.get('template_id', '?')}
 [bold]URL:[/bold] {f.get('url', '?')}
 [bold]Matched At:[/bold] {f.get('matched_at', '?')}
 [bold]Status:[/bold] {f.get('status', 'new')}
+[bold]False Positive:[/bold] {'Yes' if f.get('false_positive') else 'No'}
 [bold]Discovered:[/bold] {f.get('discovered_at', '?')}
 
 [bold]Description:[/bold]
@@ -441,6 +454,15 @@ def show_finding(finding_id):
 
 [bold]Evidence:[/bold]
 {f.get('evidence', 'N/A')}"""
+
+    # Show linked CVEs
+    cves = storage.get_finding_cves(finding_id)
+    if cves:
+        panel_text += "\n\n[bold]Linked CVEs:[/bold]"
+        for cve in cves:
+            panel_text += f"\n  {cve['id']} (CVSS {cve.get('cvss_score', '?')}, {cve.get('severity', '?')})"
+            if cve.get("description"):
+                panel_text += f"\n    {cve['description'][:200]}"
 
     if f.get("raw_json"):
         try:
@@ -450,6 +472,79 @@ def show_finding(finding_id):
             pass
 
     console.print(Panel(panel_text, title=f"Finding #{finding_id}", border_style="red"))
+
+
+# ─── False Positive Rules ─────────────────────────────────────────
+
+@cli.group("fp")
+def fp_rules():
+    """Manage false positive filtering rules."""
+    pass
+
+
+@fp_rules.command("add")
+@click.argument("rule_type", type=click.Choice(["template_id", "title", "url_pattern", "severity"]))
+@click.argument("pattern")
+@click.option("--reason", "-r", default=None, help="Why this is a false positive")
+def fp_add(rule_type, pattern, reason):
+    """Add a false positive rule. Matching findings will be auto-filtered."""
+    storage = Storage()
+    rule_id = storage.add_fp_rule(rule_type, pattern, reason)
+    console.print(f"[green]Added FP rule #{rule_id}: {rule_type} = '{pattern}'[/green]")
+
+
+@fp_rules.command("list")
+def fp_list():
+    """List all false positive rules."""
+    storage = Storage()
+    rules = storage.get_fp_rules()
+    if not rules:
+        console.print("[yellow]No FP rules configured.[/yellow]")
+        return
+    table = Table(title="False Positive Rules")
+    table.add_column("ID", style="dim")
+    table.add_column("Type")
+    table.add_column("Pattern")
+    table.add_column("Reason")
+    for r in rules:
+        table.add_row(str(r["id"]), r["rule_type"], r["pattern"], r.get("reason", "-"))
+    console.print(table)
+
+
+@fp_rules.command("remove")
+@click.argument("rule_id", type=int)
+def fp_remove(rule_id):
+    """Remove a false positive rule."""
+    storage = Storage()
+    storage.delete_fp_rule(rule_id)
+    console.print(f"[yellow]Removed FP rule #{rule_id}[/yellow]")
+
+
+@cli.command("mark-fp")
+@click.argument("finding_id", type=int)
+def mark_false_positive(finding_id):
+    """Mark a finding as false positive."""
+    storage = Storage()
+    storage.update_finding(finding_id, false_positive=1, status="dismissed")
+    console.print(f"[yellow]Finding #{finding_id} marked as false positive[/yellow]")
+
+
+@cli.command("mark-reviewed")
+@click.argument("finding_id", type=int)
+def mark_reviewed(finding_id):
+    """Mark a finding as reviewed."""
+    storage = Storage()
+    storage.update_finding(finding_id, status="reviewed")
+    console.print(f"[green]Finding #{finding_id} marked as reviewed[/green]")
+
+
+@cli.command("mark-reported")
+@click.argument("finding_id", type=int)
+def mark_reported(finding_id):
+    """Mark a finding as reported to the program."""
+    storage = Storage()
+    storage.update_finding(finding_id, status="reported")
+    console.print(f"[green]Finding #{finding_id} marked as reported[/green]")
 
 
 # ─── Maintenance ──────────────────────────────────────────────────
