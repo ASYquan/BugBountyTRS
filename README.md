@@ -1,4 +1,4 @@
-# BugBountyTRS
+# Enumeration Pipeline 
 
 A modular, continuous bug bounty reconnaissance and vulnerability scanning pipeline. Built with an event-driven architecture using Redis Streams for inter-stage communication, designed to run 24/7 and accumulate structured recon data for manual analysis and PoC development.
 
