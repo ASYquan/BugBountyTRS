@@ -30,7 +30,7 @@ Options:
   -r <rate>         Requests per second rate limit (default: 1)
   -s <scan_limit>   Max concurrent scans (default: 5)
   -o <outfile>      Output file (default: <hostname>.ferox.txt)
-  -A                Use random User-Agent (default: on)
+  -A                Use random User-Agent (default: off, uses Intigriti RoE UA)
   -g                Collect links from response body (default: on)
   -n                Disable auto-recursion
   -e <extensions>   Comma-separated extensions (e.g. php,html,js)
@@ -52,7 +52,7 @@ THREADS=1
 RATE=1
 SCAN_LIMIT=5
 OUTFILE=""
-RANDOM_AGENT=true
+RANDOM_AGENT=false
 COLLECT_LINKS=true
 NO_RECURSION=false
 EXTENSIONS=""
@@ -101,6 +101,9 @@ run_ferox() {
 
     if [[ "$RANDOM_AGENT" == true ]]; then
         args+=(-A)
+    else
+        args+=(-a "Intigriti-asquan-Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/90.0.4430.212 Safari/537.36")
+        args+=(-H "X-Bug-Bounty: Intigriti-asquan")
     fi
 
     if [[ "$COLLECT_LINKS" == true ]]; then

@@ -80,6 +80,17 @@ if ! dpkg -l libpcap-dev &>/dev/null 2>&1; then
     sudo apt-get update -qq && sudo apt-get install -y -qq libpcap-dev
 fi
 
+# ─── Web fuzzing tools ──────────────────────────────────────────
+if ! check_installed "feroxbuster"; then
+    echo -e "${YELLOW}[*] Installing feroxbuster...${NC}"
+    sudo apt-get update -qq && sudo apt-get install -y -qq feroxbuster 2>/dev/null || {
+        curl -sL https://raw.githubusercontent.com/epi052/feroxbuster/main/install-nix.sh | bash -s "$HOME/.local/bin" 2>/dev/null
+    }
+    check_installed "feroxbuster" && echo -e "${GREEN}[+] feroxbuster installed${NC}" || echo -e "${RED}[-] Failed to install feroxbuster${NC}"
+fi
+
+install_go_tool "ffuf" "github.com/ffuf/ffuf/v2@latest"
+
 # ─── BBOT ────────────────────────────────────────────────────────
 if ! check_installed "bbot"; then
     echo -e "${YELLOW}[*] Installing BBOT...${NC}"
@@ -169,7 +180,7 @@ echo ""
 echo "Installed tools:"
 echo "  Recon:     subfinder, amass, puredns, alterx, asnmap, dnsx, bbot, altdns"
 echo "  Scanning:  smap (passive), naabu (fast), nmap (deep)"
-echo "  Web:       httpx, katana, nuclei, gowitness"
+echo "  Web:       httpx, katana, nuclei, gowitness, feroxbuster, ffuf"
 echo "  Services:  domain ranking API (FastAPI + uvicorn)"
 echo ""
 echo "Next steps:"
