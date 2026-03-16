@@ -1002,6 +1002,7 @@ WORKERS = {
     "screenshot": "pipeline.stages.screenshot:ScreenshotWorker",
     "crawler": "pipeline.stages.crawler:CrawlerWorker",
     "js_analyze": "pipeline.stages.js_analyze:JSAnalyzeWorker",
+    "js_keywords": "pipeline.stages.js_keyword_extract:JSKeywordWorker",
     "github_dork": "pipeline.stages.github_dorking:GitHubDorkWorker",
     "nuclei": "pipeline.stages.nuclei_scan:NucleiScanWorker",
     "cve_correlate": "pipeline.stages.cve_correlate:CVECorrelateWorker",
