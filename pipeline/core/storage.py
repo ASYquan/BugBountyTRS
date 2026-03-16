@@ -153,12 +153,52 @@ class Storage:
                     created_at TEXT DEFAULT (datetime('now'))
                 );
 
+                CREATE TABLE IF NOT EXISTS asn_data (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    program_id INTEGER REFERENCES programs(id),
+                    domain TEXT NOT NULL,
+                    asn TEXT NOT NULL,
+                    org_name TEXT,
+                    ip_ranges_json TEXT,
+                    discovered_at TEXT DEFAULT (datetime('now')),
+                    UNIQUE(program_id, asn)
+                );
+
+                CREATE TABLE IF NOT EXISTS shodan_hosts (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    program_id INTEGER REFERENCES programs(id),
+                    ip TEXT NOT NULL,
+                    domain TEXT,
+                    ports_json TEXT,
+                    os TEXT,
+                    org TEXT,
+                    vulns_json TEXT,
+                    source TEXT,
+                    discovered_at TEXT DEFAULT (datetime('now')),
+                    UNIQUE(program_id, ip)
+                );
+
+                CREATE TABLE IF NOT EXISTS github_leaks (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    program_id INTEGER REFERENCES programs(id),
+                    domain TEXT NOT NULL,
+                    category TEXT,
+                    repo TEXT,
+                    file_path TEXT,
+                    url TEXT,
+                    dork TEXT,
+                    discovered_at TEXT DEFAULT (datetime('now')),
+                    UNIQUE(program_id, url)
+                );
+
                 CREATE INDEX IF NOT EXISTS idx_subdomains_domain ON subdomains(domain);
                 CREATE INDEX IF NOT EXISTS idx_ports_ip ON ports(ip);
                 CREATE INDEX IF NOT EXISTS idx_http_url ON http_services(url);
                 CREATE INDEX IF NOT EXISTS idx_findings_severity ON findings(severity);
                 CREATE INDEX IF NOT EXISTS idx_findings_status ON findings(status);
                 CREATE INDEX IF NOT EXISTS idx_cves_severity ON cves(severity);
+                CREATE INDEX IF NOT EXISTS idx_asn_domain ON asn_data(domain);
+                CREATE INDEX IF NOT EXISTS idx_shodan_ip ON shodan_hosts(ip);
             """)
 
             # Migrate existing findings table if needed (add new columns)

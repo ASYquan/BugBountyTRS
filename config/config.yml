@@ -33,19 +33,75 @@ intigriti:
   request_header: "X-Bug-Bounty: Intigriti-YOUR_USERNAME"
   max_rps: 20  # Hard limit from Visma RoE
 
+# Shodan API (required for shodan_recon worker + recon shodan CLI)
+# Get key from: https://account.shodan.io/
+shodan:
+  api_key: ""  # Or set SHODAN_API_KEY env var
+
+# GitHub (required for github_dork worker)
+# Uses gh CLI auth by default, or set GITHUB_TOKEN env var
+github:
+  token: ""  # Or set GITHUB_TOKEN env var
+
+# BBOT integration (subdomain enum, web scan, vuln detection)
+# Install: pipx install bbot
+bbot:
+  preset: "subdomain-enum"   # or: web-basic, kitchen-sink, spider
+  passive_only: false
+  flags: []
+  api_keys: {}               # e.g., shodan: "key", virustotal: "key"
+
+# Shodan signature scanning
+# Signatures loaded from config/shodan_signatures.yml
+# Optionally filter by category or tags:
+#   categories: [ssl, cdn_bypass, dashboards]
+#   tags: [ci_cd, database]
+
+# Domain ranking API service
+ranking_service:
+  port: 8787
+  update_interval: 86400  # 24h auto-update cycle
+  sources: ["tranco", "umbrella"]
+
 tools:
+  subdomain_discovery:
+    puredns_enabled: true
+    alterx_enabled: true
   subfinder:
-    threads: 10
+    threads: 10         # Subfinder queries third-party APIs, not the target directly
     timeout: 30
+    track_sources: true # Pass -cs flag to track which source found each sub
+  puredns:
+    wordlist: "/usr/share/wordlists/SecLists-master/Discovery/DNS/dns-Jhaddix.txt"
+    resolvers: "/usr/share/wordlists/resolvers.txt"
+    rate_limit: 1000
+    rate_limit_trusted: 300
   httpx:
     threads: 5
     rate_limit: 20  # Visma RoE: max 20 req/sec
     timeout: 10
     ports: "80,443,8080,8443,8000,3000,5000,9090"
+
+  # Tiered port scanning: smap (passive) -> naabu (fast) -> nmap (deep)
+  portscan:
+    tiers: ["smap", "naabu", "nmap"]  # Remove tiers to skip them
+  smap: {}  # No config needed — uses free Shodan InternetDB
+  caduceus:
+    concurrency: 10     # Visma RoE: keep well under 20 req/sec (TLS handshakes count)
+    ports: "443,8443,8080,4443"
+    timeout: 4          # TLS handshake timeout (seconds)
+    scan_timeout: 1800  # Overall scan timeout (seconds)
+    include_wildcards: false
+  naabu:
+    rate: 20            # Visma RoE: max 20 req/sec
+    threads: 5          # Keep low to stay within rate limit
+    top_ports: 1000
+    exclude_cdn: true   # Skip CDN IPs (Cloudflare, Akamai, etc.)
   nmap:
     top_ports: 1000
     rate: 20  # Visma RoE: max 20 req/sec
     scripts: "default,vuln"
+
   nuclei:
     threads: 5
     rate_limit: 20  # Visma RoE: max 20 req/sec

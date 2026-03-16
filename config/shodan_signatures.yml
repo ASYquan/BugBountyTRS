@@ -1,0 +1,607 @@
+# Shodan Signatures — KarmaV2-style configurable dork system
+#
+# Each signature defines a Shodan query template and optional filters.
+# {domain} is replaced with the target domain at runtime.
+#
+# Fields:
+#   name:       Human-readable signature name
+#   query:      Shodan search query ({domain} is interpolated)
+#   severity:   Finding severity (info, low, medium, high, critical)
+#   category:   Grouping tag
+#   tags:       List of tags for filtering/selection
+#   enabled:    true/false (default: true)
+#   filters:    Optional filtering rules applied to results
+#     include_headers:    Only keep results with these HTTP headers
+#     exclude_headers:    Drop results with these HTTP headers
+#     include_title:      Only keep results whose title contains these strings
+#     exclude_title:      Drop results whose title contains these strings
+#     include_products:   Only keep results matching these product strings
+#     exclude_products:   Drop results matching these product strings
+#     include_ports:      Only keep results on these ports
+#     exclude_ports:      Drop results on these ports
+#     cdn_exclude:        Drop CDN/WAF IPs (uses built-in CDN detection)
+#     min_port_count:     Only keep hosts with at least N open ports
+
+# ═══════════════════════════════════════════════════════════════════
+# SSL / Certificate Discovery
+# ═══════════════════════════════════════════════════════════════════
+
+signatures:
+
+  # --- SSL/Certificate Hunting ---
+
+  - name: "SSL Certificate (CN)"
+    query: 'ssl.cert.subject.cn:"{domain}"'
+    severity: info
+    category: ssl
+    tags: [ssl, certificate, discovery]
+
+  - name: "SSL Certificate (SAN)"
+    query: 'ssl:"{domain}"'
+    severity: info
+    category: ssl
+    tags: [ssl, certificate, discovery]
+
+  - name: "SSL Certificate (Issuer CN)"
+    query: 'ssl.cert.issuer.cn:"{domain}"'
+    severity: info
+    category: ssl
+    tags: [ssl, certificate, discovery]
+
+  - name: "SSL Subject CommonName Wildcard"
+    query: 'ssl.cert.subject.commonName:"*.{domain}"'
+    severity: info
+    category: ssl
+    tags: [ssl, wildcard, discovery]
+
+  - name: "SSL Expired Certificates"
+    query: 'ssl.cert.expired:true hostname:"*.{domain}"'
+    severity: medium
+    category: ssl
+    tags: [ssl, expired, misconfiguration]
+
+  - name: "Self-Signed Certificates"
+    query: 'ssl.cert.issuer.cn:"{domain}" ssl.cert.subject.cn:"{domain}"'
+    severity: medium
+    category: ssl
+    tags: [ssl, self_signed, misconfiguration]
+
+  # --- CDN/WAF Bypass (Real IP Discovery) ---
+
+  - name: "CDN Bypass — No Cloudflare"
+    query: 'ssl:"{domain}" -"Cloudflare"'
+    severity: medium
+    category: cdn_bypass
+    tags: [cdn_bypass, infrastructure, cloudflare]
+    filters:
+      cdn_exclude: true
+
+  - name: "CDN Bypass — No Cloudfront"
+    query: 'ssl:"{domain}" -"Cloudfront"'
+    severity: medium
+    category: cdn_bypass
+    tags: [cdn_bypass, infrastructure, cloudfront]
+    filters:
+      cdn_exclude: true
+
+  - name: "CDN Bypass — No Akamai"
+    query: 'ssl:"{domain}" -"AkamaiGHost" -"GHost"'
+    severity: medium
+    category: cdn_bypass
+    tags: [cdn_bypass, infrastructure, akamai]
+    filters:
+      cdn_exclude: true
+
+  - name: "CDN Bypass — All Major CDNs Excluded"
+    query: 'ssl:"{domain}" -"Cloudflare" -"Cloudfront" -"AkamaiGHost" -"Incapsula" -"Sucuri"'
+    severity: high
+    category: cdn_bypass
+    tags: [cdn_bypass, infrastructure, real_ip]
+    filters:
+      cdn_exclude: true
+
+  # --- Organization / Hostname Discovery ---
+
+  - name: "Hostname Search"
+    query: 'hostname:"{domain}"'
+    severity: info
+    category: discovery
+    tags: [discovery, hostname]
+
+  - name: "Organization Search"
+    query: 'org:"{domain_org}"'
+    severity: info
+    category: discovery
+    tags: [discovery, organization]
+
+  # --- VPN / Remote Access ---
+
+  - name: "VPN Infrastructure"
+    query: 'ssl.cert.subject.cn:*vpn* ssl.cert.subject.cn:"{domain}"'
+    severity: medium
+    category: vpn
+    tags: [vpn, remote_access, infrastructure]
+
+  - name: "Citrix Gateway"
+    query: 'http.title:"Citrix Gateway" hostname:"{domain}"'
+    severity: medium
+    category: vpn
+    tags: [vpn, citrix, remote_access]
+
+  - name: "Fortinet VPN"
+    query: 'http.title:"Fortinet" hostname:"{domain}"'
+    severity: medium
+    category: vpn
+    tags: [vpn, fortinet, remote_access]
+
+  - name: "OpenVPN"
+    query: 'http.title:"OpenVPN" hostname:"{domain}"'
+    severity: medium
+    category: vpn
+    tags: [vpn, openvpn]
+
+  - name: "PulseSecure / Ivanti"
+    query: 'http.html:"PulseSecure" hostname:"{domain}"'
+    severity: medium
+    category: vpn
+    tags: [vpn, pulse_secure, ivanti]
+
+  # ═══════════════════════════════════════════════════════════════════
+  # Auth / SSO / OAuth
+  # ═══════════════════════════════════════════════════════════════════
+
+  - name: "OAuth Redirect"
+    query: 'http.status:"302" "oauth" hostname:"{domain}"'
+    severity: info
+    category: auth
+    tags: [auth, oauth, redirect]
+
+  - name: "SSO Redirect"
+    query: 'http.status:"302" "sso" hostname:"{domain}"'
+    severity: info
+    category: auth
+    tags: [auth, sso, redirect]
+
+  - name: "401 Authorization Required"
+    query: 'http.title:"401 Authorization Required" hostname:"{domain}"'
+    severity: info
+    category: auth
+    tags: [auth, unauthorized]
+
+  - name: "HTTP Basic Auth"
+    query: '"WWW-Authenticate: Basic" hostname:"{domain}"'
+    severity: low
+    category: auth
+    tags: [auth, basic_auth]
+
+  # ═══════════════════════════════════════════════════════════════════
+  # CI/CD & DevOps
+  # ═══════════════════════════════════════════════════════════════════
+
+  - name: "Jenkins"
+    query: '"X-Jenkins" "Set-Cookie: JSESSIONID" hostname:"{domain}"'
+    severity: high
+    category: ci_cd
+    tags: [ci_cd, jenkins, dashboard]
+    filters:
+      include_headers: ["X-Jenkins"]
+
+  - name: "GitLab"
+    query: 'http.title:"GitLab" hostname:"{domain}"'
+    severity: high
+    category: ci_cd
+    tags: [ci_cd, gitlab, dashboard]
+
+  - name: "Drone CI"
+    query: 'http.title:"Drone CI" hostname:"{domain}"'
+    severity: high
+    category: ci_cd
+    tags: [ci_cd, drone, dashboard]
+
+  - name: "SonarQube"
+    query: 'http.title:"SonarQube" hostname:"{domain}"'
+    severity: high
+    category: ci_cd
+    tags: [ci_cd, sonarqube, code_analysis]
+
+  - name: "Confluence"
+    query: '"Confluence" hostname:"{domain}"'
+    severity: medium
+    category: ci_cd
+    tags: [ci_cd, confluence, wiki]
+
+  - name: "Jira"
+    query: 'http.title:"Jira" hostname:"{domain}"'
+    severity: medium
+    category: ci_cd
+    tags: [ci_cd, jira, project_management]
+
+  - name: "Argo CD"
+    query: 'http.title:"Argo CD" hostname:"{domain}"'
+    severity: high
+    category: ci_cd
+    tags: [ci_cd, argocd, kubernetes]
+
+  # ═══════════════════════════════════════════════════════════════════
+  # Dashboards & Monitoring
+  # ═══════════════════════════════════════════════════════════════════
+
+  - name: "Grafana"
+    query: 'http.title:"Grafana" hostname:"{domain}"'
+    severity: high
+    category: dashboards
+    tags: [dashboard, grafana, monitoring]
+
+  - name: "Kibana"
+    query: 'http.title:"Kibana" hostname:"{domain}"'
+    severity: high
+    category: dashboards
+    tags: [dashboard, kibana, logging]
+
+  - name: "Prometheus"
+    query: 'http.title:"Prometheus Time Series" hostname:"{domain}"'
+    severity: high
+    category: dashboards
+    tags: [dashboard, prometheus, monitoring]
+
+  - name: "Prometheus Node Exporter"
+    query: 'port:"9100" http.title:"Node Exporter" hostname:"{domain}"'
+    severity: medium
+    category: dashboards
+    tags: [dashboard, prometheus, node_exporter]
+
+  - name: "Kubernetes Dashboard"
+    query: 'http.title:"Kubernetes Dashboard" hostname:"{domain}"'
+    severity: critical
+    category: dashboards
+    tags: [dashboard, kubernetes, container]
+
+  - name: "cAdvisor"
+    query: 'http.title:"cAdvisor" hostname:"{domain}"'
+    severity: high
+    category: dashboards
+    tags: [dashboard, cadvisor, container]
+
+  - name: "Netdata"
+    query: 'http.title:"Netdata" hostname:"{domain}"'
+    severity: medium
+    category: dashboards
+    tags: [dashboard, netdata, monitoring]
+
+  # ═══════════════════════════════════════════════════════════════════
+  # Databases
+  # ═══════════════════════════════════════════════════════════════════
+
+  - name: "MongoDB Unauthenticated"
+    query: '"MongoDB Server Information" port:27017 -authentication hostname:"{domain}"'
+    severity: critical
+    category: databases
+    tags: [database, mongodb, unauthenticated]
+
+  - name: "Elasticsearch"
+    query: 'port:"9200" all:"elastic indices" hostname:"{domain}"'
+    severity: critical
+    category: databases
+    tags: [database, elasticsearch, unauthenticated]
+
+  - name: "Redis Exposed"
+    query: 'port:"6379" "redis_version" hostname:"{domain}"'
+    severity: critical
+    category: databases
+    tags: [database, redis, unauthenticated]
+
+  - name: "PostgreSQL"
+    query: '"PostgreSQL" port:5432 hostname:"{domain}"'
+    severity: medium
+    category: databases
+    tags: [database, postgresql]
+
+  - name: "MySQL"
+    query: 'product:"MySQL" hostname:"{domain}"'
+    severity: medium
+    category: databases
+    tags: [database, mysql]
+
+  - name: "Memcached"
+    query: 'port:"11211" product:"Memcached" hostname:"{domain}"'
+    severity: high
+    category: databases
+    tags: [database, memcached]
+
+  - name: "etcd Exposed"
+    query: 'port:"2379" product:"etcd" hostname:"{domain}"'
+    severity: critical
+    category: databases
+    tags: [database, etcd, kubernetes]
+
+  - name: "CouchDB"
+    query: 'product:"CouchDB" hostname:"{domain}"'
+    severity: high
+    category: databases
+    tags: [database, couchdb]
+
+  # ═══════════════════════════════════════════════════════════════════
+  # Container & Orchestration
+  # ═══════════════════════════════════════════════════════════════════
+
+  - name: "Docker API Exposed"
+    query: 'port:2375 product:"Docker" hostname:"{domain}"'
+    severity: critical
+    category: containers
+    tags: [container, docker, api, unauthenticated]
+
+  - name: "Kubernetes API (kubelet)"
+    query: 'product:"Kubernetes" port:"10250" hostname:"{domain}"'
+    severity: critical
+    category: containers
+    tags: [container, kubernetes, kubelet]
+
+  - name: "Portainer"
+    query: '"Portainer" port:9000 hostname:"{domain}"'
+    severity: high
+    category: containers
+    tags: [container, portainer, dashboard]
+
+  - name: "Docker Shipyard"
+    query: 'http.title:"shipyard" hostname:"{domain}"'
+    severity: high
+    category: containers
+    tags: [container, docker, shipyard]
+
+  - name: "RabbitMQ Management"
+    query: 'http.title:"RabbitMQ Management" hostname:"{domain}"'
+    severity: high
+    category: containers
+    tags: [message_queue, rabbitmq, dashboard]
+
+  # ═══════════════════════════════════════════════════════════════════
+  # Storage / File Exposure
+  # ═══════════════════════════════════════════════════════════════════
+
+  - name: "Directory Listing"
+    query: 'http.title:"Index of /" hostname:"{domain}"'
+    severity: medium
+    category: storage
+    tags: [storage, directory_listing, exposure]
+
+  - name: "Directory Listing (alt)"
+    query: 'http.title:"Directory Listing" hostname:"{domain}"'
+    severity: medium
+    category: storage
+    tags: [storage, directory_listing, exposure]
+
+  - name: "FTP Anonymous Access"
+    query: 'ftp "Anonymous access granted" hostname:"{domain}"'
+    severity: high
+    category: storage
+    tags: [storage, ftp, anonymous, unauthenticated]
+
+  - name: "S3 Bucket Index"
+    query: 'http.title:"Index of /" "s3" hostname:"{domain}"'
+    severity: high
+    category: storage
+    tags: [storage, s3, cloud, exposure]
+
+  # ═══════════════════════════════════════════════════════════════════
+  # Java / Application Servers
+  # ═══════════════════════════════════════════════════════════════════
+
+  - name: "JBoss"
+    query: '"x-powered-by" "jboss" hostname:"{domain}"'
+    severity: medium
+    category: appserver
+    tags: [appserver, jboss, java]
+    filters:
+      include_headers: ["X-Powered-By"]
+
+  - name: "JBoss Welcome"
+    query: 'http.title:"Welcome to JBoss" hostname:"{domain}"'
+    severity: high
+    category: appserver
+    tags: [appserver, jboss, default_page]
+
+  - name: "Apache Tomcat"
+    query: 'http.title:"Apache Tomcat" hostname:"{domain}"'
+    severity: medium
+    category: appserver
+    tags: [appserver, tomcat, java]
+
+  - name: "WebLogic Admin Console"
+    query: 'http.title:"Oracle WebLogic Server Administration Console" hostname:"{domain}"'
+    severity: high
+    category: appserver
+    tags: [appserver, weblogic, oracle, admin]
+
+  - name: "Oracle BI"
+    query: 'http.title:"oracle business intelligence sign in" hostname:"{domain}"'
+    severity: medium
+    category: appserver
+    tags: [appserver, oracle, bi]
+
+  # ═══════════════════════════════════════════════════════════════════
+  # Debug / Information Leaks
+  # ═══════════════════════════════════════════════════════════════════
+
+  - name: "Debug Token Link"
+    query: '"X-Debug-Token-Link" port:443 hostname:"{domain}"'
+    severity: high
+    category: debug
+    tags: [debug, info_leak, symfony]
+    filters:
+      include_headers: ["X-Debug-Token-Link"]
+
+  - name: "phpinfo()"
+    query: 'http.title:"phpinfo()" hostname:"{domain}"'
+    severity: high
+    category: debug
+    tags: [debug, info_leak, php]
+
+  - name: "Apache Status"
+    query: 'http.title:"Apache Status" hostname:"{domain}"'
+    severity: medium
+    category: debug
+    tags: [debug, info_leak, apache]
+
+  - name: "Swagger UI"
+    query: 'http.title:"Swagger UI - " hostname:"{domain}"'
+    severity: medium
+    category: debug
+    tags: [debug, api, swagger, documentation]
+
+  - name: "Spring Boot Actuator"
+    query: 'http.html:"actuator" http.html:"health" hostname:"{domain}"'
+    severity: high
+    category: debug
+    tags: [debug, spring, actuator, java]
+
+  - name: "Django Debug"
+    query: 'html:"/login/?next=" title:"Django" hostname:"{domain}"'
+    severity: high
+    category: debug
+    tags: [debug, django, python]
+
+  - name: "403 Forbidden (interesting)"
+    query: 'http.html:"403 Forbidden" hostname:"{domain}"'
+    severity: info
+    category: debug
+    tags: [debug, access_control]
+    filters:
+      min_port_count: 3
+
+  - name: "500 Internal Server Error"
+    query: 'http.html:"500 Internal Server Error" hostname:"{domain}"'
+    severity: low
+    category: debug
+    tags: [debug, error, info_leak]
+
+  # ═══════════════════════════════════════════════════════════════════
+  # Web Frameworks & CMS
+  # ═══════════════════════════════════════════════════════════════════
+
+  - name: "Moodle"
+    query: 'http.component:Moodle hostname:"{domain}"'
+    severity: info
+    category: web_framework
+    tags: [cms, moodle]
+
+  - name: "Ruby on Rails"
+    query: 'http.component:ruby port:3000 hostname:"{domain}"'
+    severity: info
+    category: web_framework
+    tags: [web_framework, ruby, rails]
+
+  - name: "Rails Secret Key Leak"
+    query: 'html:"secret_key_base" hostname:"{domain}"'
+    severity: critical
+    category: web_framework
+    tags: [web_framework, ruby, secret_leak]
+
+  - name: "WordPress"
+    query: 'http.component:WordPress hostname:"{domain}"'
+    severity: info
+    category: web_framework
+    tags: [cms, wordpress]
+
+  - name: "Laravel Debug Mode"
+    query: 'http.html:"laravel" http.html:"APP_KEY" hostname:"{domain}"'
+    severity: critical
+    category: web_framework
+    tags: [web_framework, laravel, debug, secret_leak]
+
+  # ═══════════════════════════════════════════════════════════════════
+  # Cloud / AWS
+  # ═══════════════════════════════════════════════════════════════════
+
+  - name: "AWS S3 Bucket Region Header"
+    query: 'X-Amz-Bucket-Region hostname:"{domain}"'
+    severity: info
+    category: cloud
+    tags: [cloud, aws, s3]
+
+  - name: "AWS Development"
+    query: '"development" org:"Amazon.com" hostname:"{domain}"'
+    severity: medium
+    category: cloud
+    tags: [cloud, aws, development]
+
+  # ═══════════════════════════════════════════════════════════════════
+  # Splunk / SIEM
+  # ═══════════════════════════════════════════════════════════════════
+
+  - name: "Splunk"
+    query: 'port:"8089" "splunkd" hostname:"{domain}"'
+    severity: high
+    category: siem
+    tags: [siem, splunk, dashboard]
+
+  - name: "Splunk (Favicon)"
+    query: 'http.favicon.hash:-316785925 hostname:"{domain}"'
+    severity: high
+    category: siem
+    tags: [siem, splunk, favicon]
+
+  # ═══════════════════════════════════════════════════════════════════
+  # Legacy / Protocols
+  # ═══════════════════════════════════════════════════════════════════
+
+  - name: "FTP Unusual Port"
+    query: 'ftp port:"10000" hostname:"{domain}"'
+    severity: medium
+    category: legacy
+    tags: [legacy, ftp, unusual_port]
+
+  - name: "FTP Login Successful"
+    query: '"220" "230 Login successful." port:21 hostname:"{domain}"'
+    severity: high
+    category: legacy
+    tags: [legacy, ftp, anonymous]
+
+  - name: "SMB No Auth"
+    query: '"Authentication: disabled" port:445 product:"Samba" hostname:"{domain}"'
+    severity: critical
+    category: legacy
+    tags: [legacy, smb, samba, unauthenticated]
+
+  - name: "Telnet"
+    query: 'port:23 hostname:"{domain}"'
+    severity: high
+    category: legacy
+    tags: [legacy, telnet, cleartext]
+
+  # ═══════════════════════════════════════════════════════════════════
+  # Network Services / SAP
+  # ═══════════════════════════════════════════════════════════════════
+
+  - name: "SAP NetWeaver"
+    query: '"netweaver" hostname:"{domain}"'
+    severity: high
+    category: enterprise
+    tags: [enterprise, sap, netweaver]
+
+  - name: "SAP ICM"
+    query: '"SAP Internet Communication Manager" hostname:"{domain}"'
+    severity: high
+    category: enterprise
+    tags: [enterprise, sap, icm]
+
+  # ═══════════════════════════════════════════════════════════════════
+  # Favicon Hash Fingerprinting
+  # ═══════════════════════════════════════════════════════════════════
+
+  - name: "JBoss Favicon"
+    query: 'http.favicon.hash:-656811182 hostname:"{domain}"'
+    severity: medium
+    category: favicon
+    tags: [favicon, jboss, fingerprint]
+
+  - name: "Splunk Favicon"
+    query: 'http.favicon.hash:-316785925 hostname:"{domain}"'
+    severity: medium
+    category: favicon
+    tags: [favicon, splunk, fingerprint]
+
+  - name: "Spring Boot Favicon"
+    query: 'http.favicon.hash:116323821 hostname:"{domain}"'
+    severity: info
+    category: favicon
+    tags: [favicon, spring, fingerprint]

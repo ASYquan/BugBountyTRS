@@ -11,5 +11,24 @@ services:
     command: redis-server --appendonly yes --maxmemory 512mb --maxmemory-policy allkeys-lru
     restart: unless-stopped
 
+  ranking-api:
+    build:
+      context: .
+      dockerfile: Dockerfile.ranking
+    container_name: bbtrs-ranking
+    ports:
+      - "8787:8787"
+    volumes:
+      - ./data:/app/data
+      - ./config:/app/config
+      - ./pipeline:/app/pipeline
+    environment:
+      - RANKING_DATA_DIR=/app/data
+      - RANKING_UPDATE_INTERVAL=86400
+    command: uvicorn pipeline.services.domain_ranking:app --host 0.0.0.0 --port 8787
+    restart: unless-stopped
+    depends_on:
+      - redis
+
 volumes:
   redis_data:
