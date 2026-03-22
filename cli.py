@@ -199,6 +199,82 @@ def scope_sync_intigriti(company, program, sync_all, api_token):
         console.print(f"[green]Synced Intigriti program: {company}[/green]")
 
 
+@scope.command("roe")
+@click.argument("program")
+@click.option("--fetch", is_flag=True, help="Re-fetch from Intigriti API (requires INTIGRITI_TOKEN)")
+@click.option("--api-token", envvar="INTIGRITI_TOKEN", default=None)
+def scope_roe(program, fetch, api_token):
+    """Show Rules of Engagement for a program.
+
+    Displays stored RoE constraints: rate limits, required headers,
+    automated scanning policy, and safe harbour status.
+
+    Use --fetch to pull fresh RoE directly from the Intigriti API.
+    """
+    from pipeline.core.storage import Storage
+    from pipeline.stages.platforms import IntigritiSync
+    from pipeline.stages.scope import ScopeManager
+    from rich.panel import Panel
+
+    storage = Storage()
+    prog = storage.get_program(program)
+    if not prog:
+        console.print(f"[red]Program '{program}' not found. Run: python3 cli.py scope list[/red]")
+        raise SystemExit(1)
+
+    if fetch:
+        # Re-fetch from Intigriti API and update stored RoE
+        mgr = ScopeManager()
+        inti = IntigritiSync(mgr, api_token)
+        # Strip platform prefix to get the handle/id
+        prog_id = program.removeprefix("intigriti-")
+        roe = inti.fetch_roe(prog_id)
+        if roe:
+            storage.upsert_program(program, roe=roe)
+            console.print("[green]RoE refreshed from Intigriti API.[/green]")
+        else:
+            console.print("[yellow]No RoE returned from API — showing stored data.[/yellow]")
+
+    roe = storage.get_program_roe(prog["id"])
+    if not roe:
+        console.print(f"[yellow]No RoE stored for '{program}'.[/yellow]")
+        console.print("Run: [dim]python3 cli.py scope roe {program} --fetch[/dim]")
+        return
+
+    # ── Display ────────────────────────────────────────────────────
+    auto_color = {"allowed": "green", "restricted": "yellow", "not_allowed": "red"}
+    auto = roe.get("automated_scanning", "unknown")
+
+    table = Table(title=f"Rules of Engagement — {program}", show_header=False, box=None)
+    table.add_column("Field", style="bold cyan", width=28)
+    table.add_column("Value")
+
+    table.add_row("Automated scanning",
+                  f"[{auto_color.get(auto, 'white')}]{auto}[/]")
+    table.add_row("Rate limit",
+                  f"{roe.get('rate_limit_rps', 20)} req/sec")
+    table.add_row("Safe harbour",
+                  "[green]yes[/green]" if roe.get("safe_harbour") else "[red]no[/red]")
+    table.add_row("Intigriti.me required",
+                  "[yellow]yes[/yellow]" if roe.get("intigriti_me_required") else "no")
+
+    headers = roe.get("required_headers") or {}
+    if headers:
+        for k, v in headers.items():
+            table.add_row(f"Required header: {k}", v)
+    else:
+        table.add_row("Required headers", "[dim]none[/dim]")
+
+    ua = roe.get("required_user_agent")
+    table.add_row("Required user-agent", ua or "[dim]none[/dim]")
+
+    console.print(table)
+
+    desc = roe.get("description", "").strip()
+    if desc:
+        console.print(Panel(desc, title="Policy Description", border_style="dim"))
+
+
 @scope.command("poll-activities")
 @click.option("--api-token", envvar="INTIGRITI_TOKEN", default=None)
 @click.option("--feed", is_flag=True, help="Feed newly discovered domains into the pipeline")

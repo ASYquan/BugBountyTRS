@@ -86,6 +86,7 @@ class IntigritiSync:
 
         Domains are embedded in the program detail response under domains.content[].
         There is no separate /domains endpoint in the researcher API v1.
+        RoE is fetched automatically and stored alongside scope.
         """
         log.info(f"[intigriti] Syncing program: {program_id}")
 
@@ -103,6 +104,9 @@ class IntigritiSync:
         web_links = program_data.get("webLinks", {}) or {}
         url = web_links.get("detail") or f"https://app.intigriti.com/programs/{handle}"
 
+        # Fetch and parse RoE
+        roe = self.fetch_roe(program_id, program_data)
+
         self.scope.add_program(
             name=name,
             platform="intigriti",
@@ -110,13 +114,114 @@ class IntigritiSync:
             wildcards=wildcards,
             domains=domains,
             excludes=excludes,
+            roe=roe,
         )
         log.info(
             f"[intigriti] Synced {handle}: "
             f"{len(wildcards)} wildcards, {len(domains)} domains, "
             f"{len(cidr_ranges)} CIDRs"
+            + (f", RoE fetched" if roe else "")
         )
-        return {"wildcards": wildcards, "domains": domains, "cidr_ranges": cidr_ranges}
+        return {"wildcards": wildcards, "domains": domains, "cidr_ranges": cidr_ranges, "roe": roe}
+
+    def fetch_roe(self, program_id: str, program_data: dict = None) -> dict | None:
+        """Fetch and parse the Rules of Engagement for a program.
+
+        First checks if RoE is embedded in program_data (from the detail endpoint).
+        Falls back to the dedicated /rules-of-engagements/{versionId} endpoint.
+        Returns a parsed constraints dict, or None if unavailable.
+        """
+        raw_roe = None
+
+        # Try embedded RoE in program detail response
+        if program_data:
+            raw_roe = (
+                program_data.get("rulesOfEngagements")
+                or program_data.get("rulesOfEngagement")
+                or program_data.get("roe")
+            )
+
+        # If embedded gave us only a reference (has an id/latestVersion), fetch the full doc
+        if isinstance(raw_roe, dict) and not raw_roe.get("description"):
+            version_id = (
+                raw_roe.get("id")
+                or (raw_roe.get("latestVersion") or {}).get("id")
+            )
+            if version_id:
+                raw_roe = self._get(f"/programs/{program_id}/rules-of-engagements/{version_id}")
+
+        # If still nothing embedded, try listing versions from the dedicated sub-resource
+        if not raw_roe:
+            versions = self._get(f"/programs/{program_id}/rules-of-engagements")
+            if isinstance(versions, list) and versions:
+                # Take the most recent version
+                version_id = versions[0].get("id") or versions[0].get("versionId")
+                if version_id:
+                    raw_roe = self._get(f"/programs/{program_id}/rules-of-engagements/{version_id}")
+            elif isinstance(versions, dict):
+                version_id = versions.get("id")
+                if version_id:
+                    raw_roe = self._get(f"/programs/{program_id}/rules-of-engagements/{version_id}")
+
+        if not raw_roe:
+            log.debug(f"[intigriti] No RoE found for program {program_id}")
+            return None
+
+        return self.parse_roe_constraints(raw_roe)
+
+    @staticmethod
+    def parse_roe_constraints(raw: dict) -> dict:
+        """Normalise a raw Intigriti RoE response into pipeline-usable constraints.
+
+        Returned dict keys:
+          rate_limit_rps          - int, max requests/sec (default 20 if unspecified)
+          automated_scanning      - "allowed" | "restricted" | "not_allowed"
+          required_headers        - dict of header_name -> value
+          required_user_agent     - str or None
+          intigriti_me_required   - bool (must test via intigriti.me subdomain)
+          safe_harbour            - bool
+          description             - str, full policy text
+          raw                     - original API response
+        """
+        testing = raw.get("testingRequirements") or {}
+
+        # Required headers
+        headers = {}
+        for h in (testing.get("requestHeaders") or []):
+            name = h.get("name") or h.get("key") or ""
+            value = h.get("value") or ""
+            if name:
+                headers[name] = value
+
+        # Automated scanning stance
+        auto_raw = (
+            testing.get("automatedTooling")
+            or testing.get("automatedScanning")
+            or testing.get("automated")
+            or ""
+        )
+        auto_raw = str(auto_raw).lower()
+        if "not" in auto_raw or "disallow" in auto_raw or auto_raw == "false":
+            automated = "not_allowed"
+        elif "restrict" in auto_raw or "limit" in auto_raw:
+            automated = "restricted"
+        else:
+            automated = "allowed"
+
+        # Rate limit — Intigriti doesn't always specify one explicitly;
+        # default to 20 req/sec (Visma-level conservative)
+        rate_limit = int(testing.get("rateLimit") or testing.get("maxRequestsPerSecond") or 20)
+
+        return {
+            "rate_limit_rps": rate_limit,
+            "automated_scanning": automated,
+            "required_headers": headers,
+            "required_user_agent": testing.get("userAgent") or testing.get("user_agent"),
+            "intigriti_me_required": bool(testing.get("intigritiMe") or testing.get("intigriti_me")),
+            "safe_harbour": bool(raw.get("safeHarbour") or raw.get("safe_harbour") or raw.get("safeHarbor")),
+            "description": raw.get("description") or "",
+            "raw": raw,
+        }
 
     def sync_all_programs(self):
         """Sync all programs accessible to this researcher token."""
