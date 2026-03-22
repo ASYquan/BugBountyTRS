@@ -217,10 +217,15 @@ class IntigritiSync:
             rate_limit = int(auto_tooling)
             automated = "restricted" if rate_limit <= 5 else "allowed"
 
-        # requestHeader is a plain string "Name: Value" (not an array)
+        # requestHeader is a plain string "Name: Value" (not an array).
+        # The API may return "<username>" as a placeholder — substitute real username.
+        cfg = get_config()
+        username = cfg.get("intigriti", {}).get("username", "")
         headers = {}
         req_header = testing.get("requestHeader") or ""
         if req_header:
+            if username:
+                req_header = req_header.replace("<username>", username)
             k, _, v = req_header.partition(":")
             if k.strip():
                 headers[k.strip()] = v.strip()
@@ -385,6 +390,25 @@ class IntigritiSync:
             })
 
         return new_domains
+
+    def resolve_program_id(self, handle: str) -> str:
+        """Resolve a program handle to its UUID.
+
+        The detail endpoint requires the UUID, not the handle string.
+        If the handle is already a UUID (contains '-'), return as-is.
+        Otherwise, search the programs list for a matching handle.
+        """
+        # Already looks like a UUID
+        if "-" in handle and len(handle) > 30:
+            return handle
+
+        programs = self.list_programs()
+        for prog in programs:
+            if prog.get("handle", "").lower() == handle.lower():
+                return prog.get("id") or handle
+
+        log.warning(f"[intigriti] Could not resolve handle '{handle}' to UUID — using as-is")
+        return handle
 
     # ── Private helpers ───────────────────────────────────────────
 

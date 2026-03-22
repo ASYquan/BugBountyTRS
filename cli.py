@@ -226,9 +226,12 @@ def scope_roe(program, fetch, api_token):
         # Re-fetch from Intigriti API and update stored RoE
         mgr = ScopeManager()
         inti = IntigritiSync(mgr, api_token)
-        # Strip platform prefix to get the handle/id
-        prog_id = program.removeprefix("intigriti-")
-        roe = inti.fetch_roe(prog_id)
+        # Strip platform prefix to get handle, then resolve to UUID
+        handle = program.removeprefix("intigriti-")
+        prog_id = inti.resolve_program_id(handle)
+        # Fetch full program detail so RoE is embedded (avoids extra round-trip)
+        program_data = inti._get(f"/programs/{prog_id}")
+        roe = inti.fetch_roe(prog_id, program_data)
         if roe:
             storage.upsert_program(program, roe=roe)
             console.print("[green]RoE refreshed from Intigriti API.[/green]")

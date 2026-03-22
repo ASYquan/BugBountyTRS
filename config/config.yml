@@ -28,9 +28,10 @@ workers:
 # Intigriti RoE compliance headers
 # IMPORTANT: Replace <username> with your Intigriti username
 intigriti:
-  username: "YOUR_USERNAME"
-  user_agent: "Intigriti-YOUR_USERNAME-Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/90.0.4430.212 Safari/537.36"
-  request_header: "X-Bug-Bounty: Intigriti-YOUR_USERNAME"
+  api_token: "A5460877B3C665CDC5FE3BED220749C7A55E41430526E4D7DEEC938ACB271319-1"
+  username: "asquan"
+  user_agent: "Intigriti-asquan-Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/90.0.4430.212 Safari/537.36"
+  request_header: "X-Bug-Bounty: Intigriti-asquan"
   max_rps: 20  # Hard limit from Visma RoE
 
 # Shodan API (required for shodan_recon worker + recon shodan CLI)
