@@ -1623,6 +1623,42 @@ def export_endpoints(program_name, output):
         console.print(f"[yellow]No endpoints found for '{program_name}'.[/yellow]")
 
 
+@cli.command("export-endpoints-all")
+@click.option("--output-dir", "-o", default="endpoints", help="Directory to write CSVs into")
+@click.option("--programs", "-p", default=None, help="Comma-separated program names (default: all)")
+def export_endpoints_all(output_dir, programs):
+    """Export endpoints_<program>.csv for every program that has URL data.
+
+    Creates one CSV per program named endpoints_<program_name>.csv in --output-dir.
+    Run after the pipeline has collected data to get a manual review spreadsheet.
+    """
+    from pipeline.stages.endpoint_csv import export_program_endpoints
+    from pipeline.core.storage import Storage as _Storage
+    from pathlib import Path as _Path
+
+    out_dir = _Path(output_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    storage = _Storage()
+    all_programs = storage.list_programs()
+
+    if programs:
+        wanted = {p.strip() for p in programs.split(",")}
+        all_programs = [p for p in all_programs if p["name"] in wanted]
+
+    exported = 0
+    for prog in all_programs:
+        name = prog["name"]
+        safe_name = name.replace("/", "_").replace(" ", "_")
+        out_path = out_dir / f"endpoints_{safe_name}.csv"
+        result = export_program_endpoints(name, out_path)
+        if result:
+            console.print(f"[green]  {name}[/green] → {result}")
+            exported += 1
+
+    console.print(f"\n[bold]Exported {exported}/{len(all_programs)} programs to {out_dir}/[/bold]")
+
+
 @cli.command("export")
 @click.argument("program_name")
 @click.option("--output", "-o", default=None, help="Output file path")
