@@ -181,6 +181,13 @@ class IntigritiSync:
           intigriti_me_required   - bool (must test via intigriti.me subdomain)
           safe_harbour            - bool
           description             - str, full policy text
+
+          -- Feature flags derived from description text --
+          no_bruteforce           - bool: disable content_discovery + vhost fuzzing
+          no_portscan             - bool: disable active port scanning (naabu/nmap)
+          web_only                - bool: portscan checks web ports only (80/443/8080/8443)
+          no_vuln_scan            - bool: disable nuclei vulnerability scanning
+          no_subdomain_enum       - bool: disable subdomain enumeration
           raw                     - original API response
         """
         testing = raw.get("testingRequirements") or {}
@@ -212,6 +219,9 @@ class IntigritiSync:
         # default to 20 req/sec (Visma-level conservative)
         rate_limit = int(testing.get("rateLimit") or testing.get("maxRequestsPerSecond") or 20)
 
+        description = raw.get("description") or ""
+        flags = IntigritiSync._parse_description_flags(description)
+
         return {
             "rate_limit_rps": rate_limit,
             "automated_scanning": automated,
@@ -219,8 +229,73 @@ class IntigritiSync:
             "required_user_agent": testing.get("userAgent") or testing.get("user_agent"),
             "intigriti_me_required": bool(testing.get("intigritiMe") or testing.get("intigriti_me")),
             "safe_harbour": bool(raw.get("safeHarbour") or raw.get("safe_harbour") or raw.get("safeHarbor")),
-            "description": raw.get("description") or "",
+            "description": description,
+            **flags,
             "raw": raw,
+        }
+
+    @staticmethod
+    def _parse_description_flags(description: str) -> dict:
+        """Keyword-scan free-text RoE description and return boolean feature flags.
+
+        Matches common restriction phrases in English. Conservative by default —
+        only sets a flag to True when a restriction is clearly stated.
+        """
+        text = description.lower()
+
+        def _matches(patterns: list[str]) -> bool:
+            return any(re.search(p, text) for p in patterns)
+
+        # Brute force / directory fuzzing / content discovery
+        no_bruteforce = _matches([
+            r"no.{0,10}brute.?forc",
+            r"brute.?forc.{0,20}not.{0,10}allow",
+            r"brute.?forc.{0,20}prohibit",
+            r"no.{0,10}(directory|path|content).{0,10}(scan|fuzz|brute)",
+            r"(directory|path).{0,10}(scan|fuzz).{0,20}not.{0,10}allow",
+            r"no.{0,10}fuzz(ing)?",
+            r"fuzz(ing)?.{0,20}(not allow|prohibit|forbidden)",
+        ])
+
+        # Port scanning / infrastructure / network scanning
+        no_portscan = _matches([
+            r"no.{0,10}port.?scan",
+            r"port.?scan.{0,20}(not allow|prohibit|forbidden)",
+            r"no.{0,10}(infrastructure|network).{0,10}(scan|test|attack)",
+            r"(infrastructure|network).{0,10}(scan|test).{0,20}(not allow|prohibit|out of scope)",
+            r"no.{0,10}(nmap|naabu|masscan)",
+        ])
+
+        # Web applications only — skip non-web port scanning
+        web_only = _matches([
+            r"web.{0,10}(application|app).{0,10}only",
+            r"web.{0,10}only",
+            r"only.{0,10}web.{0,10}(application|app|interface)",
+            r"(application|app).{0,10}layer.{0,10}only",
+            r"no.{0,10}(network|infrastructure|host).{0,10}(level|based).{0,10}(test|scan|attack)",
+        ])
+
+        # Vulnerability scanning (nuclei-style active probing)
+        no_vuln_scan = _matches([
+            r"no.{0,10}(vulnerability|vuln).{0,10}scan",
+            r"(vulnerability|vuln).{0,10}scan.{0,20}(not allow|prohibit|forbidden)",
+            r"no.{0,10}automated.{0,10}(vulnerability|vuln|security).{0,10}scan",
+            r"no.{0,10}(nuclei|burp|nikto|zap|openvas)",
+        ])
+
+        # Subdomain enumeration
+        no_subdomain_enum = _matches([
+            r"no.{0,10}subdomain.{0,10}(enum|discover|brute|scan)",
+            r"subdomain.{0,10}(enum|discover).{0,20}(not allow|prohibit|forbidden)",
+            r"no.{0,10}dns.{0,10}(enum|brute|scan|recon)",
+        ])
+
+        return {
+            "no_bruteforce": no_bruteforce,
+            "no_portscan": no_portscan,
+            "web_only": web_only,
+            "no_vuln_scan": no_vuln_scan,
+            "no_subdomain_enum": no_subdomain_enum,
         }
 
     def sync_all_programs(self):

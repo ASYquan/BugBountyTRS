@@ -44,9 +44,12 @@ class ContentDiscoveryWorker(BaseWorker):
         if not cfg.get("enabled", True):
             return []
 
-        # Per-program RoE: check automated scanning policy
+        # Per-program RoE: check automated scanning policy and bruteforce flag
         constraints = self.roe_constraints(data)
         if not self.is_scanning_allowed(constraints, "content_discovery"):
+            return []
+        if constraints["no_bruteforce"]:
+            log.info(f"[content] Skipping {url} — RoE prohibits brute force/fuzzing")
             return []
         roe = constraints  # keep roe alias for content_discovery_enabled check below
         if not roe.get("content_discovery_enabled", True):

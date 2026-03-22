@@ -54,8 +54,21 @@ class PortScanWorker(BaseWorker):
         constraints = self.roe_constraints(data)
         cfg = get_config()["tools"]
         scan_cfg = cfg.get("portscan", {})
-        tiers = scan_cfg.get("tiers", ["smap", "naabu", "nmap"])
         rate_rps = constraints["rate_limit_rps"]
+
+        # RoE: skip all port scanning if prohibited
+        if constraints["no_portscan"]:
+            log.info(f"[portscan] Skipping {ip} — RoE prohibits port scanning")
+            return []
+
+        tiers = scan_cfg.get("tiers", ["smap", "naabu", "nmap"])
+
+        # RoE: web_only — restrict naabu/nmap to web ports only
+        web_ports = "80,443,8080,8443,8000,3000,5000,9090"
+        naabu_extra = []
+        if constraints["web_only"]:
+            log.info(f"[portscan] web_only RoE — restricting to web ports on {ip}")
+            naabu_extra = ["-p", web_ports]
 
         # Collect ports from each tier
         all_ports = {}  # port -> port_info dict
@@ -64,7 +77,9 @@ class PortScanWorker(BaseWorker):
         if "smap" in tiers:
             smap_ports = self._run_smap(ip)
             for p in smap_ports:
-                all_ports[p["port"]] = p
+                # Filter to web ports only if required
+                if not constraints["web_only"] or p["port"] in {80, 443, 8080, 8443, 8000, 3000, 5000, 9090}:
+                    all_ports[p["port"]] = p
             log.info(f"[portscan] smap (passive): {len(smap_ports)} ports on {ip}")
 
         # Tiers 2 & 3: active — check RoE first, then acquire global scan slot
@@ -74,7 +89,8 @@ class PortScanWorker(BaseWorker):
             # Tier 2: naabu (active fast SYN scan)
             if "naabu" in tiers:
                 naabu_cfg = cfg.get("naabu", {})
-                naabu_ports = self._run_naabu(ip, naabu_cfg, rate_rps=rate_rps)
+                naabu_ports = self._run_naabu(ip, naabu_cfg, rate_rps=rate_rps,
+                                              extra_args=naabu_extra)
                 for p in naabu_ports:
                     if p["port"] not in all_ports:
                         all_ports[p["port"]] = p
@@ -231,7 +247,8 @@ class PortScanWorker(BaseWorker):
 
     # ─── Tier 2: naabu (active fast SYN scan) ────────────────────
 
-    def _run_naabu(self, target: str, cfg: dict, rate_rps: int = 20) -> list[dict]:
+    def _run_naabu(self, target: str, cfg: dict, rate_rps: int = 20,
+                   extra_args: list = None) -> list[dict]:
         """Fast port discovery with naabu. SYN scan if root, CONNECT otherwise."""
         ports = []
         rate = rate_rps or cfg.get("rate", 20)
@@ -248,6 +265,8 @@ class PortScanWorker(BaseWorker):
             "-json",
             "-silent",
         ]
+        if extra_args:
+            cmd.extend(extra_args)
 
         if exclude_cdn:
             cmd.append("-exclude-cdn")

@@ -41,6 +41,9 @@ class NucleiScanWorker(BaseWorker):
         constraints = self.roe_constraints(data)
         if not self.is_scanning_allowed(constraints, "nuclei"):
             return []
+        if constraints["no_vuln_scan"]:
+            log.info(f"[nuclei] Skipping {url} — RoE prohibits vulnerability scanning")
+            return []
         findings = self._run_nuclei(url, tech, constraints=constraints)
 
         results = []

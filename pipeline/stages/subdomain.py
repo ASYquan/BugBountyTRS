@@ -47,6 +47,11 @@ class SubdomainWorker(BaseWorker):
         if not domain:
             return []
 
+        constraints = self.roe_constraints(data)
+        if constraints["no_subdomain_enum"]:
+            log.info(f"[subdomain] Skipping {domain} — RoE prohibits subdomain enumeration")
+            return []
+
         log.info(f"[subdomain] Enumerating subdomains for {domain} ({program})")
 
         subdomains = set()

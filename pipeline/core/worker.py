@@ -191,6 +191,12 @@ class BaseWorker(ABC):
             "required_user_agent": ua,
             "safe_harbour": roe.get("safe_harbour", True),
             "intigriti_me_required": roe.get("intigriti_me_required", False),
+            # Feature flags from RoE description keyword scan
+            "no_bruteforce":      bool(roe.get("no_bruteforce", False)),
+            "no_portscan":        bool(roe.get("no_portscan", False)),
+            "web_only":           bool(roe.get("web_only", False)),
+            "no_vuln_scan":       bool(roe.get("no_vuln_scan", False)),
+            "no_subdomain_enum":  bool(roe.get("no_subdomain_enum", False)),
         }
 
     def roe_header_args(self, constraints: dict) -> list[str]:

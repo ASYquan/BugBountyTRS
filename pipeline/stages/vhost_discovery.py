@@ -66,6 +66,9 @@ class VhostDiscoveryWorker(BaseWorker):
         constraints = self.roe_constraints(data)
         if not self.is_scanning_allowed(constraints, "vhost_discovery"):
             return []
+        if constraints["no_bruteforce"]:
+            log.info(f"[vhost] Skipping {ip}:{port} — RoE prohibits brute force/fuzzing")
+            return []
 
         discovered = []
         with active_scan_slot("ffuf_vhost"):
