@@ -461,17 +461,26 @@ def altdns_mutate(keywords: list[str], known_subdomains: list[str],
 def crawl_js_files(target: str, depth: int = 3, threads: int = 5,
                    rate_limit: int = 20) -> list[str]:
     """Use katana to crawl a target and discover JS file URLs."""
+    cfg = get_config()
+    inti_cfg = cfg.get("intigriti", {})
     try:
-        result = subprocess.run(
-            [
+        cmd = [
                 "katana", "-u", target,
                 "-d", str(depth),
-                "-ct", str(threads),
+                "-c", str(threads),
                 "-rl", str(rate_limit),
                 "-ef", "css,png,jpg,jpeg,gif,svg,woff,woff2,ttf,eot,ico,mp4,mp3,pdf",
                 "-em", "js",  # Extract mode: JS files
                 "-silent",
-            ],
+            ]
+        ua = inti_cfg.get("user_agent")
+        if ua:
+            cmd.extend(["-H", f"User-Agent: {ua}"])
+        req_header = inti_cfg.get("request_header")
+        if req_header:
+            cmd.extend(["-H", req_header])
+
+        result = subprocess.run(cmd,
             capture_output=True, text=True, timeout=600,
         )
         urls = set()
@@ -490,9 +499,17 @@ def crawl_js_files(target: str, depth: int = 3, threads: int = 5,
 
 def _fallback_js_discovery(target: str) -> list[str]:
     """Fallback: use curl + grep to find JS files on a target."""
+    cfg = get_config()
+    inti_cfg = cfg.get("intigriti", {})
+    ua = inti_cfg.get("user_agent", "Mozilla/5.0")
+    req_header = inti_cfg.get("request_header", "")
+    curl_cmd = ["curl", "-sL", "--max-time", "30", "-H", f"User-Agent: {ua}"]
+    if req_header:
+        curl_cmd.extend(["-H", req_header])
+    curl_cmd.append(target)
     try:
         result = subprocess.run(
-            ["curl", "-sL", "--max-time", "30", target],
+            curl_cmd,
             capture_output=True, text=True, timeout=35,
         )
         urls = set()
@@ -515,9 +532,18 @@ def _fallback_js_discovery(target: str) -> list[str]:
 
 def download_js(url: str, timeout: int = 15) -> str | None:
     """Download a JS file and return its content."""
+    cfg = get_config()
+    inti_cfg = cfg.get("intigriti", {})
+    ua = inti_cfg.get("user_agent", "Mozilla/5.0")
+    req_header = inti_cfg.get("request_header", "")
+    curl_cmd = ["curl", "-sL", "--max-time", str(timeout),
+                "-H", f"User-Agent: {ua}"]
+    if req_header:
+        curl_cmd.extend(["-H", req_header])
+    curl_cmd.extend(["-o", "-", url])
     try:
         result = subprocess.run(
-            ["curl", "-sL", "--max-time", str(timeout), "-o", "-", url],
+            curl_cmd,
             capture_output=True, text=True, timeout=timeout + 5,
         )
         if result.returncode == 0 and result.stdout:

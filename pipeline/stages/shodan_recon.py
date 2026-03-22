@@ -13,7 +13,10 @@ import logging
 import time
 from pathlib import Path
 
-import yaml
+try:
+    import yaml
+except ImportError:
+    yaml = None
 
 from ..core.worker import BaseWorker
 from ..core.config import get_config
@@ -320,8 +323,8 @@ class ShodanReconWorker(BaseWorker):
             with self.storage._conn() as conn:
                 conn.execute(
                     """INSERT OR REPLACE INTO shodan_hosts
-                       (program_id, ip, domain, ports_json, os, org, vulns_json, updated_at)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, datetime('now'))""",
+                       (program_id, ip, domain, ports_json, os, org, vulns_json, source, discovered_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, 'shodan', datetime('now'))""",
                     (
                         program_id, ip, domain,
                         json.dumps(match.get("ports", [])),

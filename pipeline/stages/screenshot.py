@@ -10,6 +10,7 @@ from pathlib import Path
 
 from ..core.worker import BaseWorker
 from ..core.config import get_config
+from ..core.ratelimit import tracked_run
 
 log = logging.getLogger(__name__)
 
@@ -56,12 +57,11 @@ class ScreenshotWorker(BaseWorker):
         out_dir.mkdir(parents=True, exist_ok=True)
 
         try:
-            result = subprocess.run(
+            result = tracked_run(
                 [
-                    "gowitness", "single",
-                    "--url", url,
+                    "gowitness", "scan", "single",
+                    "-u", url,
                     "--screenshot-path", str(out_dir),
-                    "--timeout", str(timeout),
                 ],
                 capture_output=True, text=True, timeout=30,
             )

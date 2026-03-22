@@ -13,6 +13,7 @@ from pathlib import Path
 
 from ..core.worker import BaseWorker
 from ..core.config import get_config
+from ..core.ratelimit import active_scan_slot, tracked_run
 
 log = logging.getLogger(__name__)
 
@@ -37,7 +38,8 @@ class NucleiScanWorker(BaseWorker):
 
         log.info(f"[nuclei] Scanning {url}")
 
-        findings = self._run_nuclei(url, tech)
+        roe = self.get_program_roe(program_id)
+        findings = self._run_nuclei(url, tech, roe=roe)
 
         results = []
         for finding in findings:
@@ -70,11 +72,13 @@ class NucleiScanWorker(BaseWorker):
         log.info(f"[nuclei] Found {len(findings)} issues on {url}")
         return results
 
-    def _run_nuclei(self, target: str, tech: list = None) -> list[dict]:
+    def _run_nuclei(self, target: str, tech: list = None, roe: dict = None) -> list[dict]:
         cfg = get_config()["tools"].get("nuclei", {})
         inti_cfg = get_config().get("intigriti", {})
-        threads = cfg.get("threads", 25)
-        rate_limit = cfg.get("rate_limit", 20)
+        roe = roe or {}
+        threads = cfg.get("threads", 5)
+        # Per-program rate limit overrides global config
+        rate_limit = roe.get("max_rps") or cfg.get("rate_limit", 20)
         severity = cfg.get("severity", "low,medium,high,critical")
 
         # Build tag filters based on detected tech
@@ -133,7 +137,14 @@ class NucleiScanWorker(BaseWorker):
             if tags:
                 cmd.extend(["-tags", ",".join(tags)])
 
-            subprocess.run(cmd, capture_output=True, text=True, timeout=900)
+            # Exclude vulnerability categories out-of-scope per program RoE
+            excluded_tags = roe.get("excluded_vuln_tags", [])
+            if excluded_tags:
+                cmd.extend(["-etags", ",".join(excluded_tags)])
+                log.debug(f"[nuclei] Excluding tags per RoE: {excluded_tags}")
+
+            with active_scan_slot(f"nuclei:{target}"):
+                tracked_run(cmd, capture_output=True, text=True, timeout=900)
 
             return self._parse_results(output_path)
 

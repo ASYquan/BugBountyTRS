@@ -12,6 +12,7 @@ import json
 
 from ..core.worker import BaseWorker
 from ..core.config import get_config
+from .scope import ScopeManager
 
 log = logging.getLogger(__name__)
 
@@ -20,6 +21,10 @@ class DNSResolveWorker(BaseWorker):
     name = "dns_resolve"
     input_stream = "recon_subdomains"
     output_streams = ["recon_resolved"]
+
+    def on_start(self):
+        self._scope = ScopeManager()
+        self._scope.load_programs()
 
     def dedup_key(self, data: dict) -> str:
         return f"dns:{data.get('domain', '')}"
@@ -30,6 +35,13 @@ class DNSResolveWorker(BaseWorker):
         program_id = data.get("program_id")
 
         if not domain:
+            return []
+
+        # Skip domains that are out of scope — prevents noise from cert/passive DNS
+        # discovery tools that return unrelated domains (e.g., example.com entries)
+        in_scope, _ = self._scope.is_in_scope(domain, program_name=program)
+        if not in_scope:
+            log.debug(f"[dns] Skipping out-of-scope domain: {domain}")
             return []
 
         records = self._resolve(domain)
@@ -43,9 +55,8 @@ class DNSResolveWorker(BaseWorker):
         with self.storage._conn() as conn:
             for rec in records:
                 conn.execute(
-                    """INSERT INTO dns_records (subdomain_id, record_type, value, updated_at)
-                       VALUES (?, ?, ?, datetime('now'))
-                       ON CONFLICT DO NOTHING""",
+                    """INSERT OR IGNORE INTO dns_records (subdomain_id, record_type, value, updated_at)
+                       VALUES (?, ?, ?, datetime('now'))""",
                     (subdomain_id, rec["type"], rec["value"]),
                 )
 
@@ -96,7 +107,8 @@ class DNSResolveWorker(BaseWorker):
                 )
                 for line in result.stdout.splitlines():
                     val = line.strip().rstrip(".")
-                    if val:
+                    # Skip dig error/comment lines (e.g. ";; comm error", "[thc ->")
+                    if val and not val.startswith(";") and not val.startswith("["):
                         records.append({"type": rtype, "value": val})
             except (subprocess.TimeoutExpired, FileNotFoundError):
                 pass

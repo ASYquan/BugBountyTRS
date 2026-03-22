@@ -8,6 +8,7 @@ from abc import ABC, abstractmethod
 from .queue import MessageQueue
 from .dedup import Dedup
 from .storage import Storage
+from .ratelimit import PipelineShuttingDown
 
 log = logging.getLogger(__name__)
 
@@ -65,6 +66,14 @@ class BaseWorker(ABC):
             def _signal_handler(sig, frame):
                 log.info(f"[{self.name}] Received signal {sig}, shutting down...")
                 self._running = False
+                # Also unblock any tracked_run / active_scan_slot waits so
+                # subprocesses (nmap, nuclei, httpx, etc.) are killed immediately
+                # instead of the process hanging until they finish.
+                try:
+                    from .ratelimit import _shutdown_event as _rl_evt
+                    _rl_evt.set()
+                except Exception:
+                    pass
             signal.signal(signal.SIGINT, _signal_handler)
             signal.signal(signal.SIGTERM, _signal_handler)
 
@@ -100,6 +109,13 @@ class BaseWorker(ABC):
                         # Ack
                         self.mq.ack(self.input_stream, msg_id)
 
+                    except PipelineShuttingDown:
+                        # Pipeline is shutting down — ack the message so it isn't
+                        # redelivered on next start, then exit immediately.
+                        self.mq.ack(self.input_stream, msg_id)
+                        self._running = False
+                        break
+
                     except Exception as e:
                         log.error(f"[{self.name}] Error processing message: {e}", exc_info=True)
                         self.mq.ack(self.input_stream, msg_id)
@@ -110,6 +126,16 @@ class BaseWorker(ABC):
 
         self.on_stop()
         log.info(f"[{self.name}] Worker stopped.")
+
+    def get_program_roe(self, program_id: int | None) -> dict:
+        """Return the RoE constraints for a program, or {} if not set.
+
+        Workers use this to apply per-program overrides for rate limits,
+        nuclei tag exclusions, crawl depth, and feature flags.
+        """
+        if not program_id:
+            return {}
+        return self.storage.get_program_roe(int(program_id))
 
     def stop(self):
         self._running = False

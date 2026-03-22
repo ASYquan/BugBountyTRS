@@ -23,8 +23,9 @@ DEFAULT_INTERVAL = 86400
 class Scheduler:
     """Periodically re-feeds scope targets into the pipeline."""
 
-    def __init__(self, interval: int = None):
+    def __init__(self, interval: int = None, program_filter: str = None):
         self.interval = interval or DEFAULT_INTERVAL
+        self.program_filter = program_filter
         self.scope_manager = ScopeManager()
         self._running = False
 
@@ -40,13 +41,14 @@ class Scheduler:
             signal.signal(signal.SIGINT, _handle_signal)
             signal.signal(signal.SIGTERM, _handle_signal)
 
-        log.info(f"[scheduler] Starting with {self.interval}s interval")
+        filter_msg = f" (program: {self.program_filter})" if self.program_filter else ""
+        log.info(f"[scheduler] Starting with {self.interval}s interval{filter_msg}")
 
         while self._running:
             try:
                 log.info("[scheduler] Loading programs and feeding targets...")
                 self.scope_manager.load_programs()
-                self.scope_manager.feed_targets()
+                self.scope_manager.feed_targets(program_filter=self.program_filter)
                 log.info(f"[scheduler] Targets fed. Sleeping {self.interval}s until next cycle.")
             except Exception as e:
                 log.error(f"[scheduler] Error: {e}", exc_info=True)

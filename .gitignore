@@ -37,6 +37,13 @@ redis_data/
 *.env
 config/config.local.yml
 
+# Personal / runtime
+submissions/
+resume.cfg
+quickstart.md
+endpoint_analysis/
+payload.bin
+
 # Presentation (not part of the tool)
 *.pptx
 *.pdf

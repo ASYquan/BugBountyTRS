@@ -17,6 +17,7 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 from ..core.worker import BaseWorker
+from ..core.config import get_config
 
 log = logging.getLogger(__name__)
 
@@ -73,9 +74,11 @@ class JSAnalyzeWorker(BaseWorker):
 
         content_hash = hashlib.sha256(content.encode()).hexdigest()
 
-        # Analyze
+        # Analyze — merge regex results with LinkFinder (handles minified/bundled JS)
         secrets = self._find_secrets(content)
-        endpoints = self._find_endpoints(content)
+        endpoints_regex = self._find_endpoints(content)
+        endpoints_lf = self._linkfinder_endpoints(js_url)
+        endpoints = sorted(set(endpoints_regex) | set(endpoints_lf))
 
         # Store
         with self.storage._conn() as conn:
@@ -130,9 +133,17 @@ class JSAnalyzeWorker(BaseWorker):
         return results
 
     def _download(self, url: str) -> str | None:
+        inti_cfg = get_config().get("intigriti", {})
+        ua = inti_cfg.get("user_agent", "Mozilla/5.0")
+        req_header = inti_cfg.get("request_header", "")
+        curl_cmd = ["curl", "-sL", "--max-time", "15",
+                    "-H", f"User-Agent: {ua}"]
+        if req_header:
+            curl_cmd.extend(["-H", req_header])
+        curl_cmd.extend(["-o", "-", url])
         try:
             result = subprocess.run(
-                ["curl", "-sL", "--max-time", "15", "-o", "-", url],
+                curl_cmd,
                 capture_output=True, text=True, timeout=20,
             )
             if result.returncode == 0 and result.stdout:
@@ -165,6 +176,50 @@ class JSAnalyzeWorker(BaseWorker):
                 if len(ep) > 5 and not ep.startswith("//"):
                     endpoints.add(ep)
         return sorted(endpoints)
+
+    def _linkfinder_endpoints(self, js_url: str) -> list[str]:
+        """Run LinkFinder against a JS URL.
+
+        LinkFinder deobfuscates minified JS with jsbeautifier before regex matching,
+        finding endpoints our raw-content regex misses in bundled code.
+        Falls back silently if linkfinder is not installed.
+        """
+        cfg = get_config()
+        inti_cfg = cfg.get("intigriti", {})
+        ua = inti_cfg.get("user_agent", "Mozilla/5.0")
+        req_header = inti_cfg.get("request_header", "")
+
+        # Try both common install locations
+        for cmd_name in ("linkfinder", "linkfinder.py",
+                         "/usr/local/bin/linkfinder.py",
+                         "/opt/LinkFinder/linkfinder.py"):
+            cmd = ["python3", cmd_name, "-i", js_url, "-o", "cli",
+                   "--user-agent", ua] if cmd_name.endswith(".py") else \
+                  [cmd_name, "-i", js_url, "-o", "cli", "--user-agent", ua]
+            if req_header:
+                cmd.extend(["--header", req_header])
+            try:
+                result = subprocess.run(
+                    cmd, capture_output=True, text=True, timeout=30,
+                )
+                if result.returncode == 0 and result.stdout.strip():
+                    endpoints = []
+                    for line in result.stdout.strip().splitlines():
+                        line = line.strip()
+                        if line and not line.startswith("[") and len(line) > 3:
+                            endpoints.append(line)
+                    if endpoints:
+                        log.debug(f"[js] LinkFinder found {len(endpoints)} endpoints in {js_url}")
+                    return endpoints
+            except FileNotFoundError:
+                continue
+            except subprocess.TimeoutExpired:
+                log.debug(f"[js] LinkFinder timed out on {js_url}")
+                return []
+            except Exception:
+                continue
+
+        return []
 
     def _is_false_positive(self, secret_type: str, value: str) -> bool:
         """Basic false positive filtering."""

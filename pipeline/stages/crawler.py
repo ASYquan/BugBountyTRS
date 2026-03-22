@@ -13,6 +13,7 @@ from urllib.parse import urlparse
 
 from ..core.worker import BaseWorker
 from ..core.config import get_config
+from ..core.ratelimit import active_scan_slot, tracked_run
 
 log = logging.getLogger(__name__)
 
@@ -20,7 +21,7 @@ log = logging.getLogger(__name__)
 class CrawlerWorker(BaseWorker):
     name = "crawler"
     input_stream = "recon_http"
-    output_streams = ["recon_urls"]
+    output_streams = ["recon_urls", "recon_js"]
 
     def dedup_key(self, data: dict) -> str:
         return f"crawl:{data.get('url', '')}"
@@ -36,7 +37,8 @@ class CrawlerWorker(BaseWorker):
 
         log.info(f"[crawler] Crawling {url}")
 
-        discovered = self._run_katana(url)
+        roe = self.get_program_roe(program_id)
+        discovered = self._run_katana(url, roe=roe)
 
         results = []
         js_files = []
@@ -103,13 +105,15 @@ class CrawlerWorker(BaseWorker):
         log.info(f"[crawler] Found {len(discovered)} URLs, {len(js_files)} JS files from {url}")
         return results
 
-    def _run_katana(self, target: str) -> list[str]:
+    def _run_katana(self, target: str, roe: dict = None) -> list[str]:
         cfg = get_config()["tools"].get("katana", {})
         inti_cfg = get_config().get("intigriti", {})
-        depth = cfg.get("depth", 3)
+        roe = roe or {}
+        # Per-program RoE can reduce crawl depth ("no more data than needed for PoC")
+        depth = roe.get("max_crawl_depth") or cfg.get("depth", 3)
         threads = cfg.get("threads", 10)
         timeout = cfg.get("timeout", 15)
-        rate_limit = cfg.get("rate_limit", 20)
+        rate_limit = roe.get("max_rps") or cfg.get("rate_limit", 20)
 
         cmd = [
             "katana",
@@ -133,10 +137,11 @@ class CrawlerWorker(BaseWorker):
             cmd.extend(["-H", req_header])
 
         try:
-            result = subprocess.run(
-                cmd,
-                capture_output=True, text=True, timeout=300,
-            )
+            with active_scan_slot(f"katana:{target}"):
+                result = tracked_run(
+                    cmd,
+                    capture_output=True, text=True, timeout=300,
+                )
             return [line.strip() for line in result.stdout.splitlines() if line.strip()]
         except FileNotFoundError:
             log.warning("katana not found")

@@ -31,6 +31,7 @@ class Storage:
                     platform TEXT,
                     url TEXT,
                     scope_json TEXT,
+                    roe_json TEXT,
                     created_at TEXT DEFAULT (datetime('now')),
                     updated_at TEXT DEFAULT (datetime('now'))
                 );
@@ -50,7 +51,8 @@ class Storage:
                     subdomain_id INTEGER REFERENCES subdomains(id),
                     record_type TEXT,
                     value TEXT,
-                    updated_at TEXT DEFAULT (datetime('now'))
+                    updated_at TEXT DEFAULT (datetime('now')),
+                    UNIQUE(subdomain_id, record_type, value)
                 );
 
                 CREATE TABLE IF NOT EXISTS ports (
@@ -199,31 +201,83 @@ class Storage:
                 CREATE INDEX IF NOT EXISTS idx_cves_severity ON cves(severity);
                 CREATE INDEX IF NOT EXISTS idx_asn_domain ON asn_data(domain);
                 CREATE INDEX IF NOT EXISTS idx_shodan_ip ON shodan_hosts(ip);
+
+                CREATE TABLE IF NOT EXISTS apex_domains (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    program_id INTEGER REFERENCES programs(id),
+                    domain TEXT NOT NULL,
+                    source TEXT,
+                    discovered_at TEXT DEFAULT (datetime('now')),
+                    UNIQUE(program_id, domain)
+                );
+
+                CREATE TABLE IF NOT EXISTS vhosts (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    program_id INTEGER REFERENCES programs(id),
+                    ip TEXT NOT NULL,
+                    vhost TEXT NOT NULL,
+                    port INTEGER,
+                    status_code INTEGER,
+                    discovered_at TEXT DEFAULT (datetime('now')),
+                    UNIQUE(program_id, ip, vhost)
+                );
+
+                CREATE TABLE IF NOT EXISTS takeover_candidates (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    program_id INTEGER REFERENCES programs(id),
+                    subdomain TEXT NOT NULL,
+                    cname TEXT,
+                    service TEXT,
+                    confidence TEXT DEFAULT 'medium',
+                    status TEXT DEFAULT 'unconfirmed',
+                    discovered_at TEXT DEFAULT (datetime('now')),
+                    UNIQUE(program_id, subdomain)
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_apex_domain ON apex_domains(domain);
+                CREATE INDEX IF NOT EXISTS idx_vhosts_ip ON vhosts(ip);
+                CREATE INDEX IF NOT EXISTS idx_takeover_subdomain ON takeover_candidates(subdomain);
             """)
 
-            # Migrate existing findings table if needed (add new columns)
-            cols = {r[1] for r in conn.execute("PRAGMA table_info(findings)").fetchall()}
-            migrations = {
+            # Migrate existing tables (add new columns safely)
+            self._migrate(conn, "programs", {
+                "roe_json": "ALTER TABLE programs ADD COLUMN roe_json TEXT",
+            })
+            self._migrate(conn, "findings", {
                 "cve_id": "ALTER TABLE findings ADD COLUMN cve_id TEXT",
                 "cvss_score": "ALTER TABLE findings ADD COLUMN cvss_score REAL",
                 "false_positive": "ALTER TABLE findings ADD COLUMN false_positive INTEGER DEFAULT 0",
                 "dedup_hash": "ALTER TABLE findings ADD COLUMN dedup_hash TEXT",
-            }
-            for col, sql in migrations.items():
-                if col not in cols:
-                    try:
-                        conn.execute(sql)
-                    except sqlite3.OperationalError:
-                        pass
+            })
+            self._migrate(conn, "http_services", {
+                "asn": "ALTER TABLE http_services ADD COLUMN asn TEXT",
+                "cdn": "ALTER TABLE http_services ADD COLUMN cdn TEXT",
+                "ip": "ALTER TABLE http_services ADD COLUMN ip TEXT",
+            })
 
             # Create indexes on potentially-migrated columns (safe after migration)
             for idx_sql in [
                 "CREATE INDEX IF NOT EXISTS idx_findings_cve ON findings(cve_id)",
                 "CREATE INDEX IF NOT EXISTS idx_findings_dedup ON findings(dedup_hash)",
                 "CREATE INDEX IF NOT EXISTS idx_findings_fp ON findings(false_positive)",
+                # UNIQUE indexes that may be missing from DBs created before these
+                # constraints were added to the CREATE TABLE statements
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_dns_records_unique ON dns_records(subdomain_id, record_type, value)",
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_ports_unique ON ports(subdomain_id, ip, port, protocol)",
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_urls_unique ON urls(url, method)",
             ]:
                 try:
                     conn.execute(idx_sql)
+                except sqlite3.OperationalError:
+                    pass
+
+    def _migrate(self, conn: sqlite3.Connection, table: str, migrations: dict):
+        """Add missing columns to an existing table."""
+        cols = {r[1] for r in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+        for col, sql in migrations.items():
+            if col not in cols:
+                try:
+                    conn.execute(sql)
                 except sqlite3.OperationalError:
                     pass
 
@@ -236,20 +290,37 @@ class Storage:
 
     # --- Programs ---
 
-    def upsert_program(self, name: str, platform: str = None, url: str = None, scope: list = None) -> int:
+    def upsert_program(self, name: str, platform: str = None, url: str = None,
+                       scope: list = None, roe: dict = None) -> int:
         with self._conn() as conn:
             conn.execute(
-                """INSERT INTO programs (name, platform, url, scope_json, updated_at)
-                   VALUES (?, ?, ?, ?, datetime('now'))
+                """INSERT INTO programs (name, platform, url, scope_json, roe_json, updated_at)
+                   VALUES (?, ?, ?, ?, ?, datetime('now'))
                    ON CONFLICT(name) DO UPDATE SET
                      platform=COALESCE(excluded.platform, platform),
                      url=COALESCE(excluded.url, url),
                      scope_json=COALESCE(excluded.scope_json, scope_json),
+                     roe_json=COALESCE(excluded.roe_json, roe_json),
                      updated_at=datetime('now')""",
-                (name, platform, url, json.dumps(scope) if scope else None),
+                (name, platform, url,
+                 json.dumps(scope) if scope else None,
+                 json.dumps(roe) if roe else None),
             )
             row = conn.execute("SELECT id FROM programs WHERE name=?", (name,)).fetchone()
             return row["id"]
+
+    def get_program_roe(self, program_id: int) -> dict:
+        """Return the RoE dict for a program, or empty dict if not set."""
+        with self._conn() as conn:
+            row = conn.execute(
+                "SELECT roe_json FROM programs WHERE id=?", (program_id,)
+            ).fetchone()
+        if row and row["roe_json"]:
+            try:
+                return json.loads(row["roe_json"])
+            except (json.JSONDecodeError, TypeError):
+                pass
+        return {}
 
     def get_program(self, name: str) -> dict | None:
         with self._conn() as conn:
@@ -551,6 +622,130 @@ class Storage:
                 ).fetchall()]
 
             return findings
+
+    # --- Apex Domains ---
+
+    def upsert_apex_domain(self, program_id: int, domain: str, source: str = None) -> int:
+        with self._conn() as conn:
+            conn.execute(
+                """INSERT INTO apex_domains (program_id, domain, source)
+                   VALUES (?, ?, ?)
+                   ON CONFLICT(program_id, domain) DO UPDATE SET
+                     source=COALESCE(excluded.source, source)""",
+                (program_id, domain, source),
+            )
+            row = conn.execute(
+                "SELECT id FROM apex_domains WHERE program_id=? AND domain=?",
+                (program_id, domain),
+            ).fetchone()
+            return row["id"] if row else None
+
+    def get_apex_domains(self, program_id: int) -> list[dict]:
+        with self._conn() as conn:
+            return [dict(r) for r in conn.execute(
+                "SELECT * FROM apex_domains WHERE program_id=?", (program_id,)
+            ).fetchall()]
+
+    # --- Virtual Hosts ---
+
+    def upsert_vhost(self, program_id: int, ip: str, vhost: str,
+                     port: int = None, status_code: int = None) -> int:
+        with self._conn() as conn:
+            conn.execute(
+                """INSERT INTO vhosts (program_id, ip, vhost, port, status_code)
+                   VALUES (?, ?, ?, ?, ?)
+                   ON CONFLICT(program_id, ip, vhost) DO UPDATE SET
+                     status_code=COALESCE(excluded.status_code, status_code)""",
+                (program_id, ip, vhost, port, status_code),
+            )
+            row = conn.execute(
+                "SELECT id FROM vhosts WHERE program_id=? AND ip=? AND vhost=?",
+                (program_id, ip, vhost),
+            ).fetchone()
+            return row["id"] if row else None
+
+    def get_vhosts(self, program_id: int) -> list[dict]:
+        with self._conn() as conn:
+            return [dict(r) for r in conn.execute(
+                "SELECT * FROM vhosts WHERE program_id=?", (program_id,)
+            ).fetchall()]
+
+    # --- Takeover Candidates ---
+
+    def upsert_takeover_candidate(self, program_id: int, subdomain: str, **kwargs) -> int:
+        with self._conn() as conn:
+            conn.execute(
+                """INSERT INTO takeover_candidates
+                   (program_id, subdomain, cname, service, confidence, status)
+                   VALUES (?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(program_id, subdomain) DO UPDATE SET
+                     cname=COALESCE(excluded.cname, cname),
+                     service=COALESCE(excluded.service, service),
+                     confidence=COALESCE(excluded.confidence, confidence)""",
+                (
+                    program_id, subdomain,
+                    kwargs.get("cname"),
+                    kwargs.get("service"),
+                    kwargs.get("confidence", "medium"),
+                    kwargs.get("status", "unconfirmed"),
+                ),
+            )
+            row = conn.execute(
+                "SELECT id FROM takeover_candidates WHERE program_id=? AND subdomain=?",
+                (program_id, subdomain),
+            ).fetchone()
+            return row["id"] if row else None
+
+    def get_takeover_candidates(self, program_id: int) -> list[dict]:
+        with self._conn() as conn:
+            return [dict(r) for r in conn.execute(
+                "SELECT * FROM takeover_candidates WHERE program_id=?", (program_id,)
+            ).fetchall()]
+
+    # --- Endpoint CSV export ---
+
+    def get_endpoints_for_csv(self, program_name: str) -> list[dict]:
+        """Query all HTTP services + URLs for a program, formatted for CSV export."""
+        program = self.get_program(program_name)
+        if not program:
+            return []
+        pid = program["id"]
+
+        with self._conn() as conn:
+            rows = conn.execute(
+                """SELECT
+                    hs.url, hs.status_code, hs.title, hs.content_length,
+                    hs.webserver, hs.tech_json, hs.ip, hs.asn, hs.cdn,
+                    s.domain as source_apex,
+                    hs.updated_at as timestamp
+                   FROM http_services hs
+                   JOIN subdomains s ON s.id = hs.subdomain_id
+                   WHERE s.program_id = ?
+                   ORDER BY hs.updated_at DESC""",
+                (pid,),
+            ).fetchall()
+
+        results = []
+        for r in rows:
+            row = dict(r)
+            tech_raw = row.pop("tech_json", None)
+            tech = ""
+            if tech_raw:
+                try:
+                    import json as _json
+                    t = _json.loads(tech_raw)
+                    tech = ",".join(t.keys()) if isinstance(t, dict) else ",".join(str(x) for x in t)
+                except Exception:
+                    tech = str(tech_raw)
+            row["tech"] = tech
+            row["program"] = program_name
+            row["method"] = "GET"
+            row["params"] = ""
+            row["port"] = ""
+            row["source_tool"] = "httpx"
+            results.append(row)
+
+        return results
 
     # --- Export for Claude Code analysis ---
 

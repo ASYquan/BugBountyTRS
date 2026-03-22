@@ -58,6 +58,8 @@ install_go_tool "puredns"     "github.com/d3mondev/puredns/v2@latest"
 install_go_tool "gowitness"   "github.com/sensepost/gowitness@latest"
 install_go_tool "smap"        "github.com/s0md3v/smap/cmd/smap@latest"
 install_go_tool "caduceus"    "github.com/g0ldencybersec/Caduceus/cmd/caduceus@latest"
+install_go_tool "subzy"       "github.com/PentestPad/subzy@latest"
+install_go_tool "jsluice"     "github.com/BishopFox/jsluice/cmd/jsluice@latest"
 
 # ─── System tools ───────────────────────────────────────────────
 if ! check_installed "nmap"; then
@@ -70,9 +72,8 @@ if ! check_installed "dig"; then
     sudo apt-get update -qq && sudo apt-get install -y -qq dnsutils
 fi
 
-if ! check_installed "amass"; then
-    install_go_tool "amass" "github.com/owasp-amass/amass/v4/...@master"
-fi
+# amass kept as fallback but bbot is preferred
+# install_go_tool "amass" "github.com/owasp-amass/amass/v4/...@master"
 
 # libpcap-dev (required for naabu SYN scans)
 if ! dpkg -l libpcap-dev &>/dev/null 2>&1; then
@@ -117,21 +118,32 @@ fi
 
 # ─── Python deps ────────────────────────────────────────────────
 echo -e "${YELLOW}[*] Installing Python dependencies...${NC}"
-pip3 install -r requirements.txt 2>/dev/null || pip install -r requirements.txt
+
+# Kali Linux (and Debian 12+) use PEP 668 externally-managed environments.
+# Use --break-system-packages to install globally, which is correct for a
+# dedicated pentest/recon system (not a shared dev machine).
+PIP_FLAGS="--break-system-packages --quiet"
+
+pip3 install $PIP_FLAGS -r requirements.txt && \
+    echo -e "${GREEN}[+] requirements.txt installed${NC}" || \
+    echo -e "${RED}[-] Failed to install requirements.txt${NC}"
 
 # FastAPI + uvicorn for domain ranking API
-pip3 install fastapi uvicorn pydantic 2>/dev/null || pip install fastapi uvicorn pydantic
+pip3 install $PIP_FLAGS fastapi uvicorn pydantic && \
+    echo -e "${GREEN}[+] FastAPI/uvicorn installed${NC}"
 
 # Shodan Python library
-pip3 install shodan 2>/dev/null || pip install shodan
+pip3 install $PIP_FLAGS shodan && \
+    echo -e "${GREEN}[+] shodan installed${NC}"
 
 # PyYAML for signature loading
-pip3 install pyyaml 2>/dev/null || pip install pyyaml
+pip3 install $PIP_FLAGS pyyaml && \
+    echo -e "${GREEN}[+] pyyaml installed${NC}"
 
 # Altdns for JS keyword subdomain mutation
 if ! check_installed "altdns"; then
     echo -e "${YELLOW}[*] Installing altdns...${NC}"
-    pip3 install py-altdns 2>/dev/null || pip install py-altdns 2>/dev/null
+    pip3 install $PIP_FLAGS py-altdns
     check_installed "altdns" && echo -e "${GREEN}[+] altdns installed${NC}" || echo -e "${RED}[-] Failed to install altdns${NC}"
 fi
 
@@ -139,6 +151,16 @@ fi
 if command -v nuclei &>/dev/null; then
     echo -e "${YELLOW}[*] Updating nuclei templates...${NC}"
     nuclei -update-templates 2>/dev/null || true
+fi
+
+# ─── tenant_domains.sh ──────────────────────────────────────────
+TENANT_SCRIPT="./scripts/tenant_domains.sh"
+if [ ! -f "$TENANT_SCRIPT" ]; then
+    echo -e "${YELLOW}[*] Downloading tenant_domains.sh (Microsoft tenant apex discovery)...${NC}"
+    curl -sL "https://raw.githubusercontent.com/sw33tLie/sns/main/sns.sh" -o "$TENANT_SCRIPT" 2>/dev/null || \
+    curl -sL "https://github.com/vortexau/dnsvalidator/raw/master/dnsvalidator/lists/resolvers.txt" -o "$TENANT_SCRIPT" 2>/dev/null || \
+    echo -e "${YELLOW}[!] tenant_domains.sh not downloaded automatically — place manually at $TENANT_SCRIPT${NC}"
+    chmod +x "$TENANT_SCRIPT" 2>/dev/null || true
 fi
 
 # ─── Subfinder provider config ──────────────────────────────────
@@ -178,9 +200,11 @@ echo ""
 echo -e "${GREEN}[+] Installation complete!${NC}"
 echo ""
 echo "Installed tools:"
-echo "  Recon:     subfinder, amass, puredns, alterx, asnmap, dnsx, bbot, altdns"
+echo "  Recon:     subfinder, bbot, puredns, alterx, asnmap, dnsx, altdns"
 echo "  Scanning:  smap (passive), naabu (fast), nmap (deep)"
 echo "  Web:       httpx, katana, nuclei, gowitness, feroxbuster, ffuf"
+echo "  Takeover:  subzy, nuclei takeover templates"
+echo "  JS:        jsluice"
 echo "  Services:  domain ranking API (FastAPI + uvicorn)"
 echo ""
 echo "Next steps:"

@@ -1,159 +1,153 @@
-# Enumeration Pipeline
+# BugBountyTRS
 
-A modular, continuous bug bounty reconnaissance and vulnerability scanning pipeline. Built with an event-driven architecture using Redis Streams for inter-stage communication, designed to run 24/7 and accumulate structured recon data for manual analysis and PoC development.
+Continuous attack surface mapping pipeline for bug bounty. Redis Streams event bus, SQLite storage, stateless Python workers. Runs 24/7 and keeps accumulating structured recon data you can dig into manually.
+
+Built on ideas from Erlend Leiknes's TRS presentation, Jason Haddix's TBHM/Modern Recon methodology, and the Brzozowski automation blog.
 
 ## Architecture
 
 ```
-Scheduler (periodic re-feed)
-    |
-[scope:targets] --> Subdomain Discovery (subfinder + amass + crt.sh + puredns + alterx)
-    |                ASN Discovery (asnmap + amass intel + Team Cymru)
-    |                Cert Discovery (caduceus TLS/SNI scanning)
-    |                BBOT Discovery (all-in-one subdomain + web scan)
-    |                Shodan Recon (signature-based dork scanning)
-    |                GitHub Dorking (gh CLI code search)
-    |
-[recon:subdomains] --> DNS Resolution (dig, dangling CNAME detection)
-    |
-[recon:resolved] --> Port Scanning (smap passive -> naabu fast -> nmap deep)
-    |
-[recon:ports] --> HTTP Probing (httpx + tech detection)
-    |
-[recon:http] --> Crawler (katana)       + Screenshots (gowitness) + Nuclei Scanning
-    |                |
-[recon:urls]    [recon:js] --> JS Keyword Extraction + altdns subdomain mutation
-    |
-[vuln:findings] --> SQLite DB (structured, exportable as JSON)
+Intigriti API  ──► scope_targets ──► Apex Discovery (tenant_domains)
+                        │
+                        ├──► Subdomain Discovery  (subfinder -all + BBOT in parallel)
+                        ├──► Passive DNS          (Crobat/Sonar, CIRCL, Umbrella Top 1M)
+                        ├──► ASN Discovery        (asnmap + Team Cymru)
+                        ├──► Cert Discovery       (caduceus TLS/SNI scanning)
+                        ├──► Shodan Recon         (83 signature dorks, karma-style)
+                        ├──► GitHub Dorking       (gh CLI code search)
+                        └──► Credential Recon     (DeHashed + Flare dark web)
 
-[Domain Ranking API] --> FastAPI service for prioritizing targets by Tranco/Umbrella rank
+                   recon_subdomains ──► Takeover Check  (subzy + nuclei)
+                        │
+                   recon_resolved  ──► Port Scanning   (smap -> naabu -> nmap)
+                        │
+                   recon_ports     ──► HTTP Probing    (httpx + tech detection)
+                        │               VHost Discovery (ffuf Host fuzzing)
+                        │
+                   recon_http      ──► Content Discovery (feroxbuster recursive)
+                        │               Crawler          (katana)
+                        │               Screenshots      (gowitness)
+                        │               Nuclei           (vuln templates)
+                        │               Endpoint CSV     (continuous CSV output)
+                        │
+                   recon_urls ──► JS Analysis     (secrets + endpoints)
+                        │         JS Keywords     (altdns mutation)
+                        │
+                   vuln_findings ──► CVE Correlate  -> SQLite DB
+                                      Finding Filter
 ```
 
-### Design Principles
+How it works:
 
-- **Event-driven**: Each stage is a stateless worker consuming from Redis Streams and publishing to the next
-- **Continuous**: The scheduler re-feeds all scope targets on a configurable interval (default 24h)
-- **Deduplication**: Redis TTL keys prevent rescanning the same target within a cycle
-- **Rate-limit aware**: All tools respect configurable rate limits for RoE compliance
-- **RoE header injection**: Configurable User-Agent and custom headers injected into all HTTP-touching tools
-- **Structured storage**: SQLite database with full relational model; JSON export for external analysis
-- **Tiered scanning**: Port scanning uses a 3-tier approach (passive -> fast -> deep) to minimize noise
-- **JS-driven wordlists**: Keywords mined from JavaScript files feed into altdns for target-specific subdomain mutation
+- Each stage is a stateless worker consuming a Redis Stream. Drop in a new worker file and register it, and it's part of the pipeline.
+- The scheduler re-feeds all scope targets on a configurable interval (default 24h) so it keeps running without manual kicks.
+- Redis TTL keys handle dedup so the same target doesn't get rescanned mid-cycle.
+- 20 req/sec hard cap enforced via a distributed Redis mutex (`active_scan_slot`). All HTTP tools inject the `X-Bug-Bounty` header automatically.
+- Port scanning goes passive first (smap/InternetDB), then fast SYN scan (naabu), then deep service scan (nmap -sV) if you want it.
+- Discord/Slack webhooks for things worth knowing about: takeovers, new apex domains, new HTTP services.
+- All discovered endpoints get written to a live CSV as the pipeline runs.
 
 ## Requirements
 
 - Python 3.11+
-- Docker (for Redis)
-- Go 1.20+ (for installing tools)
+- Docker (Redis)
+- Go 1.20+ (for Go-based tools)
 
 ## Quick Start
 
-### 1. Install dependencies
+### 1. Install tools
 
 ```bash
-# Install Python packages
-pip install -r requirements.txt
-
-# Install recon tools
 bash scripts/install_tools.sh
 ```
 
-### 2. Configure
-
-Edit `config/config.yml`:
-
-```yaml
-intigriti:
-  username: "YOUR_USERNAME"
-  user_agent: "Intigriti-YOUR_USERNAME-Mozilla/5.0 ..."
-  request_header: "X-Bug-Bounty: Intigriti-YOUR_USERNAME"
-  max_rps: 20
-
-# Optional API keys for extended coverage
-shodan:
-  api_key: "YOUR_SHODAN_KEY"   # or set SHODAN_API_KEY env var
-
-github:
-  token: "YOUR_GITHUB_TOKEN"   # or set GITHUB_TOKEN env var
-```
-
-Set your platform username and rate limits according to the target program's Rules of Engagement.
-
-Add API keys for subfinder sources in `~/.config/subfinder/provider-config.yaml` (created by the installer).
-
-### 3. Start Redis
+### 2. Start Redis
 
 ```bash
 docker compose up -d
 ```
 
-### 4. Add target programs
+### 3. Configure
+
+Edit `config/config.yml`. The main things to fill in:
+
+```yaml
+intigriti:
+  username: "YOUR_USERNAME"
+  api_token: ""                 # Set INTIGRITI_TOKEN env var, or fill here
+  user_agent: "Intigriti-YOUR_USERNAME-Mozilla/5.0 ..."
+  request_header: "X-Bug-Bounty: Intigriti-YOUR_USERNAME"
+  max_rps: 20
+
+notifications:
+  discord_webhook: ""           # Optional, or set DISCORD_WEBHOOK env var
+  slack_webhook: ""
+
+shodan:
+  api_key: ""                   # Set SHODAN_API_KEY env var
+
+github:
+  token: ""                     # Set GITHUB_TOKEN env var
+```
+
+Add subfinder API keys in `~/.config/subfinder/provider-config.yaml` (the installer creates this file).
+
+### 4. Add programs
 
 ```bash
-# Add manually with wildcards
+# Sync all Intigriti programs
+INTIGRITI_TOKEN=your_token python3 cli.py scope sync-intigriti visma --all
+
+# Add manually
 python3 cli.py scope add my-target -p intigriti -w "*.example.com" -w "*.example.org"
 
 # Sync from HackerOne
 python3 cli.py scope sync-h1 <program-handle>
-
-# Sync from Intigriti
-python3 cli.py scope sync-intigriti <company-handle>
-
-# Import from file (format: name|*.wildcard.com,domain.com|exclude.com)
-python3 cli.py scope import programs.txt
 ```
 
-### 5. Run the pipeline
+### 5. Run
 
 ```bash
-# Run all stages continuously (recommended)
+# All workers + scheduler, runs indefinitely
 python3 cli.py run all
 
-# Or run a single stage
-python3 cli.py run stage subdomain
-python3 cli.py run stage nuclei
+# In a second terminal, watch for scope changes
+python3 cli.py run monitor --interval 3600
 ```
 
-### 6. Monitor and export
+### 6. Check results
 
 ```bash
-# Check pipeline status
 python3 cli.py status
-
-# List findings
-python3 cli.py findings
 python3 cli.py findings --severity high
 python3 cli.py finding <id>
 
-# Export structured data for analysis
-python3 cli.py export <program-name>
-python3 cli.py export-all
+# Export endpoints CSV for manual review
+python3 cli.py export-endpoints my-program -o endpoints.csv
+
+# Full JSON export
+python3 cli.py export my-program
 ```
 
 ## One-Shot Recon Commands
 
-Run individual recon tools outside the pipeline for quick manual investigation:
-
 ```bash
-# Subdomain enumeration (subfinder + amass + crt.sh + puredns + alterx)
+# Full subdomain discovery (subfinder + BBOT + puredns + alterx)
 python3 cli.py recon subdomains example.com -p my-program
-
-# Certificate transparency
-python3 cli.py recon crtsh example.com --wildcard
 
 # DNS brute-force
 python3 cli.py recon puredns example.com
 
-# Subdomain permutations
+# Subdomain permutations from a known-subs list
 python3 cli.py recon alterx subdomains.txt
 
-# ASN discovery (find CIDR ranges and seed domains)
+# ASN + CIDR range discovery
 python3 cli.py recon asn example.com --seeds
 
 # TLS certificate scanning across CIDR ranges
 python3 cli.py recon certs 192.168.1.0/24 -d example.com
 
-# Shodan signature scanning
+# Shodan signature scanning (karma-style)
 python3 cli.py recon shodan example.com --leaks
 
 # GitHub dorking
@@ -161,183 +155,172 @@ python3 cli.py recon github-dork example.com
 
 # Port scanning (passive/fast/deep tiers)
 python3 cli.py recon portscan example.com --passive-only
-python3 cli.py recon portscan example.com --fast
 python3 cli.py recon portscan example.com --deep
 
-# BBOT all-in-one scan
+# BBOT all-in-one
 python3 cli.py recon bbot example.com -P subdomain-enum
+
+# Content discovery (feroxbuster recursive)
+python3 cli.py recon content-discovery https://example.com -p my-program
+
+# Virtual host fuzzing
+python3 cli.py recon vhost 1.2.3.4 example.com --port 443
+
+# Takeover check (subzy + nuclei)
+python3 cli.py recon takeover my-program
 ```
 
-## JS Keyword Extraction and Altdns Mutation
+## Pipeline Stages
 
-The `js_keyword_extract` stage mines JavaScript files for target-specific keywords and uses them to generate subdomain permutations with altdns. This follows Jason Haddix's methodology of building custom wordlists from the target's own JS rather than relying solely on generic lists.
+| Stage | Tool(s) | Input -> Output |
+|---|---|---|
+| **Apex Discovery** | tenant_domains.sh | scope_targets -> scope_targets |
+| **Passive DNS** | Crobat/Sonar, CIRCL, Umbrella | scope_targets -> recon_subdomains |
+| **Subdomain Discovery** | subfinder -all, BBOT, puredns, alterx | scope_targets -> recon_subdomains |
+| **ASN Discovery** | asnmap, Team Cymru | scope_targets -> recon_subdomains |
+| **Cert Discovery** | caduceus (TLS/SNI) | scope_targets -> recon_subdomains |
+| **Shodan Recon** | shodan API + 83 signatures | scope_targets -> recon_resolved, vuln_findings |
+| **GitHub Dorking** | gh CLI code search | scope_targets -> vuln_findings |
+| **Credential Recon** | DeHashed, Flare.io, DefaultCreds | scope_targets -> vuln_findings |
+| **Takeover Check** | subzy, nuclei takeover/ | recon_subdomains -> vuln_findings |
+| **DNS Resolution** | dig, socket (CNAME takeover detection) | recon_subdomains -> recon_resolved |
+| **Port Scanning** | smap (passive) -> naabu (fast) -> nmap (deep) | recon_resolved -> recon_ports |
+| **VHost Discovery** | ffuf Host header fuzzing | recon_ports -> recon_subdomains |
+| **HTTP Probing** | httpx | recon_ports -> recon_http |
+| **Content Discovery** | feroxbuster recursive | recon_http -> recon_urls |
+| **Screenshots** | gowitness | recon_http -> *(terminal)* |
+| **Web Crawling** | katana | recon_http -> recon_urls, recon_js |
+| **Nuclei Scanning** | nuclei | recon_http -> vuln_findings |
+| **Endpoint CSV** | file writer | recon_http + recon_urls -> endpoints.csv |
+| **JS Analysis** | regex (secrets, endpoints) | recon_js -> vuln_findings |
+| **JS Keywords** | regex + altdns mutation | recon_js -> custom.txt + DB |
+| **CVE Correlate** | NVD API | vuln_findings -> vuln_findings |
+| **Finding Filter** | rule-based FP suppression | vuln_findings -> vuln_findings |
 
-### How it works
+## Data Model
 
-1. **Crawl**: katana discovers JS file URLs on the target
-2. **Extract**: Regex engine pulls out paths, parameters, hostnames, API routes, identifiers, and string literals from each JS file
-3. **Categorize**: Keywords are sorted into subdomain, path, parameter, and combined wordlists
-4. **Mutate**: Subdomain-relevant keywords are fed into altdns as a mutation wordlist against known subdomains, generating permuted candidates (e.g., keyword `api` + known sub `dev.example.com` produces `api-dev.example.com`, `dev-api.example.com`, `api.dev.example.com`)
-5. **Output**: Mutated candidates are written to `data/<domain>/custom.txt`, ready for DNS resolution with puredns
+SQLite (`data/bbtrs.db`):
 
-### Pipeline mode
-
-When running as a pipeline worker, the JS keyword stage automatically:
-- Stores extracted keywords in the `js_keywords` database table
-- Pulls known subdomains for the program from the database
-- Runs altdns mutation and writes `custom.txt`
-
-### Standalone usage
-
-```python
-from pipeline.stages.js_keyword_extract import mine_keywords, altdns_mutate
-
-# Full pipeline: crawl -> extract -> build wordlists -> altdns mutate
-result = mine_keywords(
-    "https://example.com",
-    domain="example.com",
-    known_subdomains=["dev.example.com", "api.example.com"],
-)
-# Result includes stats, wordlists, and path to custom.txt
-
-# Or run altdns mutation directly with your own keyword list
-candidates = altdns_mutate(
-    keywords=["api", "staging", "internal", "portal"],
-    known_subdomains=["dev.example.com", "mail.example.com"],
-    domain="example.com",
-    output_path="./my_custom.txt",
-)
-```
-
-### Resolving the output
-
-Feed `custom.txt` into puredns to validate which candidates actually resolve:
-
-```bash
-puredns resolve data/example.com/custom.txt \
-    --resolvers /usr/share/wordlists/resolvers.txt \
-    --write data/example.com/resolved_custom.txt
-```
-
-## Domain Ranking API
-
-A standalone FastAPI microservice that ranks discovered subdomains by their Tranco and Cisco Umbrella popularity scores. Useful for prioritizing which targets to investigate first.
-
-```bash
-# Start the ranking service
-uvicorn pipeline.services.domain_ranking:app --port 8787 &
-
-# Or run in Docker
-docker build -f Dockerfile.ranking -t bbtrs-ranking .
-docker run -d -p 8787:8787 bbtrs-ranking
-
-# Look up a single domain
-curl http://localhost:8787/rank/example.com
-
-# Prioritize all subdomains for a program
-curl http://localhost:8787/prioritize/my-program
-```
-
-The service auto-refreshes its ranking data from Tranco and Umbrella every 24 hours.
-
-## Shodan Signature Scanning
-
-The Shodan recon stage uses configurable signatures from `config/shodan_signatures.yml` to run targeted dork queries. Signatures are organized by category:
-
-| Category | Examples |
+| Table | Contents |
 |---|---|
-| `ssl` | Certificate CN/SAN, wildcard, expired, self-signed |
-| `cdn_bypass` | Real IP behind Cloudflare, Cloudfront, Akamai |
-| `ci_cd` | Jenkins, GitLab, Drone, SonarQube, Confluence, Jira |
-| `dashboards` | Grafana, Kibana, Prometheus, Kubernetes Dashboard |
-| `databases` | MongoDB, Elasticsearch, Redis, PostgreSQL, CouchDB |
-| `containers` | Docker API, kubelet, Portainer, RabbitMQ |
-| `debug` | phpinfo, Swagger UI, Spring Actuator, Django debug |
-| `legacy` | FTP, SMB, Telnet on unusual ports |
-| `enterprise` | SAP NetWeaver, Oracle BI |
-
-Each signature supports per-query filters (required headers, title patterns, port constraints, CDN exclusion) and severity ratings.
+| `programs` | Program definitions, scope wildcards |
+| `apex_domains` | Company-owned apex domains (tenant discovery) |
+| `subdomains` | Discovered subdomains with source tracking |
+| `dns_records` | A, CNAME, MX, NS, TXT records |
+| `ports` | Open ports with service/version/banner |
+| `http_services` | Live HTTP services, tech stack, headers, titles |
+| `urls` | Discovered URLs and parameters |
+| `js_files` | JS files with extracted secrets and endpoints |
+| `findings` | Vuln findings with CVE links, dedup hash, FP flag |
+| `cves` | CVE records (CVSS, affected product, versions) |
+| `fp_rules` | False positive rules (template_id, title, url_pattern) |
+| `asn_data` | ASN + CIDR ranges per program |
+| `shodan_hosts` | Shodan host data |
+| `github_leaks` | GitHub dorking results |
+| `vhosts` | Virtual hosts discovered per IP |
+| `takeover_candidates` | Subdomain takeover candidates |
 
 ## CLI Reference
 
 | Command | Description |
 |---|---|
-| `scope add <name>` | Add a program with `-w` wildcards, `-d` domains, `-e` excludes |
-| `scope list` | List all configured programs |
-| `scope import <file>` | Bulk import from text file |
-| `scope feed` | Manually push all targets into the pipeline |
-| `scope sync-h1 <handle>` | Sync scope from HackerOne |
-| `scope sync-intigriti <company>` | Sync scope from Intigriti |
-| `run all` | Run all workers + scheduler continuously |
+| `scope add <name>` | Add program with `-w` wildcards, `-d` domains, `-e` excludes |
+| `scope list` | List configured programs |
+| `scope sync-intigriti <co> --all` | Sync all Intigriti programs |
+| `scope poll-activities --feed` | Check for scope changes, feed new domains |
+| `run all` | Run all workers + scheduler (continuous) |
+| `run monitor` | Poll Intigriti activities, auto-feed new domains |
 | `run stage <name>` | Run a single stage worker |
 | `recon subdomains <domain>` | Full subdomain enumeration |
-| `recon crtsh <domain>` | Certificate transparency lookup |
 | `recon puredns <domain>` | DNS brute-force |
-| `recon alterx <file>` | Subdomain permutation generation |
-| `recon asn <target>` | ASN and CIDR range discovery |
-| `recon certs <cidr>` | TLS certificate scanning |
+| `recon alterx <file>` | Subdomain permutations |
+| `recon asn <target>` | ASN + CIDR discovery |
+| `recon certs <cidr>` | TLS cert scanning |
 | `recon shodan <domain>` | Shodan signature scanning |
-| `recon github-dork <domain>` | GitHub code search dorking |
-| `recon portscan <target>` | Tiered port scanning |
-| `recon bbot <domain>` | BBOT all-in-one scan |
-| `status` | Show pipeline statistics |
-| `findings` | List vulnerability findings with filters |
-| `finding <id>` | Show detailed finding info |
-| `export <program>` | Export program data as JSON |
-| `export-all` | Export all programs |
+| `recon github-dork <domain>` | GitHub code search |
+| `recon portscan <target>` | Tiered port scan |
+| `recon bbot <domain>` | BBOT all-in-one |
+| `recon content-discovery <url>` | feroxbuster recursive |
+| `recon vhost <ip> <apex>` | ffuf vhost fuzzing |
+| `recon takeover <program>` | subzy + nuclei takeover check |
+| `status` | Pipeline statistics |
+| `findings` | List findings (filterable by severity, status) |
+| `finding <id>` | Detailed finding view |
+| `export <program>` | Export JSON for analysis |
+| `export-endpoints <program>` | Export endpoints CSV |
+| `fp add` | Add false positive filter rule |
+| `mark-fp <id>` | Mark finding as false positive |
+| `mark-reviewed <id>` | Mark finding as reviewed |
+| `mark-reported <id>` | Mark finding as reported |
 | `flush` | Clear streams and/or dedup cache |
 
-## Pipeline Stages
+## Notifications
 
-| Stage | Tool(s) | Input Stream | Output Stream |
-|---|---|---|---|
-| **Subdomain Discovery** | subfinder, amass, crt.sh, puredns, alterx | `scope:targets` | `recon:subdomains` |
-| **ASN Discovery** | asnmap, amass intel, Team Cymru DNS | `scope:targets` | `recon:subdomains` |
-| **Cert Discovery** | caduceus (TLS/SNI scanning) | `scope:targets` | `recon:subdomains` |
-| **BBOT Discovery** | bbot (all-in-one scanner) | `scope:targets` | `recon:subdomains`, `recon:resolved`, `vuln:findings` |
-| **Shodan Recon** | shodan API + signatures | `scope:targets` | `recon:resolved`, `vuln:findings` |
-| **GitHub Dorking** | gh CLI (code search) | `scope:targets` | `vuln:findings` |
-| **DNS Resolution** | dig, socket | `recon:subdomains` | `recon:resolved` |
-| **Port Scanning** | smap (passive), naabu (fast), nmap (deep) | `recon:resolved` | `recon:ports` |
-| **HTTP Probing** | httpx | `recon:ports` | `recon:http` |
-| **Screenshots** | gowitness | `recon:http` | *(terminal)* |
-| **Web Crawling** | katana | `recon:http` | `recon:urls`, `recon:js` |
-| **JS Keyword Extraction** | regex engine, altdns | `recon:js` | `custom.txt` + DB |
-| **JS Analysis** | regex engine | `recon:js` | `vuln:findings` |
-| **Nuclei Scanning** | nuclei | `recon:http` | `vuln:findings` |
+Set Discord/Slack webhooks in `config.yml` or via env vars (`DISCORD_WEBHOOK`, `SLACK_WEBHOOK`) to get alerts for:
 
-## Data Model
+- `takeover_found`: subdomain takeover candidate confirmed
+- `new_apex_domain`: new company-owned domain found via tenant lookup
+- `new_http_service`: new HTTP service found by httpx
+- `scan_complete`: pipeline cycle done
 
-All data is stored in SQLite (`data/bbtrs.db`) with the following tables:
+Rate-limited to 1 notification per event type per 5 minutes.
 
-- `programs` - Bug bounty program definitions and scope
-- `subdomains` - Discovered subdomains per program (with source tracking)
-- `dns_records` - DNS records (A, AAAA, CNAME, MX, NS, TXT)
-- `ports` - Open ports with service/version info
-- `http_services` - Live HTTP services with tech stack, headers, titles
-- `urls` - Discovered URLs with parameters
-- `js_files` - Analyzed JavaScript files with extracted secrets and endpoints
-- `js_keywords` - Extracted JS keywords per URL (paths, params, subdomains, routes, identifiers)
-- `findings` - Vulnerability findings with CVE correlation, dedup hashing, and false positive filtering
-- `cves` - CVE records linked to findings
-- `finding_cves` - Many-to-many link between findings and CVEs
-- `fp_rules` - False positive filtering rules (template_id, title, url_pattern, severity)
-- `asn_data` - ASN and CIDR range data per program
-- `shodan_hosts` - Shodan host data (ports, OS, org, vulns)
-- `github_leaks` - GitHub dorking results by category
+## Project Structure
 
-Use `python3 cli.py export <program>` to dump everything as structured JSON.
+```
+BugBountyTRS/
+├── cli.py                          # CLI (Click)
+├── config/
+│   ├── config.yml                  # All tool + pipeline config
+│   └── shodan_signatures.yml       # 83 Shodan dork signatures by category
+├── docs/
+│   ├── methodology.md              # Recon methodology reference
+│   └── conversation_log.md         # Architecture decision log
+├── pipeline/
+│   ├── core/
+│   │   ├── config.py, queue.py, dedup.py, worker.py
+│   │   ├── storage.py              # SQLite with migrations
+│   │   └── ratelimit.py            # Distributed scan mutex (Redis)
+│   ├── services/
+│   │   └── domain_ranking.py       # FastAPI Tranco+Umbrella ranking service
+│   └── stages/                     # One file per pipeline stage
+│       ├── scope.py, scheduler.py, platforms.py
+│       ├── apex_discovery.py       # tenant_domains Microsoft apex enum
+│       ├── passive_dns.py          # Crobat/CIRCL/Umbrella passive DNS
+│       ├── subdomain.py            # subfinder + BBOT + puredns + alterx
+│       ├── asn_discovery.py, cert_discovery.py, bbot_discovery.py
+│       ├── shodan_recon.py, github_dorking.py
+│       ├── dns_resolve.py, portscan.py
+│       ├── vhost_discovery.py      # ffuf Host header fuzzing
+│       ├── httpprobe.py
+│       ├── content_discovery.py    # feroxbuster recursive
+│       ├── takeover_check.py       # subzy + nuclei takeover templates
+│       ├── screenshot.py, crawler.py
+│       ├── js_analyze.py, js_keyword_extract.py
+│       ├── nuclei_scan.py
+│       ├── credential_recon.py     # DeHashed + Flare + DefaultCreds
+│       ├── cve_correlate.py, finding_filter.py
+│       ├── endpoint_csv.py         # Continuous CSV endpoint writer
+│       └── notification.py         # Discord/Slack event dispatcher
+├── scripts/
+│   ├── install_tools.sh            # Installs all tools
+│   ├── sni_lookup.sh               # Kaeferjaeger SNI data extraction
+│   └── tenant_domains.sh           # Microsoft tenant apex discovery
+└── data/                           # Runtime data (gitignored)
+    ├── bbtrs.db
+    ├── endpoints.csv               # Continuous endpoint output
+    ├── screenshots/
+    └── programs/<name>/export.json
+```
 
 ## Adding Custom Stages
-
-Create a new worker by extending `BaseWorker`:
 
 ```python
 from pipeline.core.worker import BaseWorker
 
-class MyCustomWorker(BaseWorker):
+class MyWorker(BaseWorker):
     name = "my_stage"
-    input_stream = "recon_http"       # config key from streams section
+    input_stream = "recon_http"
     output_streams = ["vuln_findings"]
 
     def dedup_key(self, data: dict) -> str:
@@ -345,100 +328,11 @@ class MyCustomWorker(BaseWorker):
 
     def process(self, data: dict) -> list[dict]:
         url = data.get("url")
-        # Your logic here
-        return [{"finding": "something", "url": url}]
+        # your logic here
+        return [{"tool": "my_stage", "severity": "info", "url": url}]
 ```
 
-Register it in `cli.py` under the `WORKERS` dict and it will be included in `run all`.
-
-## Configuration
-
-All tool settings are in `config/config.yml`. Key settings:
-
-- **Rate limits**: Set per-tool to comply with program RoE
-- **Intigriti headers**: Auto-injected into httpx, nuclei, katana
-- **Dedup TTL**: How long before a target is re-scanned (default 24h)
-- **Stream names**: Customize the Redis stream topology
-- **Port scan tiers**: Enable/disable smap, naabu, nmap independently
-- **Nmap**: Top ports, scan rate, NSE scripts
-- **Nuclei**: Template dirs, severity filters, thread counts
-- **Shodan signatures**: Loaded from `config/shodan_signatures.yml` with per-query filters
-- **BBOT**: Preset selection, passive-only mode, API key passthrough
-- **Domain ranking**: Tranco + Umbrella source selection, update interval
-- **Caduceus**: TLS scan concurrency, ports, timeout
-
-## Standalone Scripts
-
-Helper scripts in `scripts/` for manual use outside the pipeline:
-
-| Script | Purpose |
-|---|---|
-| `subfinder_httpx.sh` | Subdomain enum + HTTP probing combo |
-| `crtsh_subs.sh` | Certificate transparency lookup |
-| `puredns_brute.sh` | DNS brute-force with puredns |
-| `alterx_permute.sh` | Subdomain permutation generation |
-| `scope_filter.sh` | Filter subdomains against program scope |
-| `ferox_enum.sh` | Directory brute-force with feroxbuster |
-| `vhost_fuzz.sh` | Virtual host fuzzing |
-| `sni_lookup.sh` | SNI-based hostname discovery |
-| `github_secret_scan.sh` | GitHub secret scanning |
-
-## Project Structure
-
-```
-BugBountyTRS/
-├── cli.py                          # Main CLI entry point
-├── Dockerfile.ranking              # Docker image for ranking API
-├── config/
-│   ├── config.yml                  # Pipeline configuration
-│   └── shodan_signatures.yml       # Shodan dork signatures by category
-├── docker-compose.yml              # Redis (+ optional ranking service)
-├── requirements.txt                # Python dependencies
-├── scripts/
-│   ├── install_tools.sh            # Tool installer
-│   ├── subfinder_httpx.sh          # Subdomain + HTTP probe combo
-│   ├── crtsh_subs.sh               # crt.sh lookup
-│   ├── puredns_brute.sh            # DNS brute-force
-│   ├── alterx_permute.sh           # Subdomain permutations
-│   ├── scope_filter.sh             # Scope filtering
-│   ├── ferox_enum.sh               # Directory brute-force
-│   ├── vhost_fuzz.sh               # Virtual host fuzzing
-│   ├── sni_lookup.sh               # SNI hostname discovery
-│   └── github_secret_scan.sh       # GitHub secret scanning
-├── pipeline/
-│   ├── core/
-│   │   ├── config.py               # Config loader
-│   │   ├── queue.py                # Redis Streams wrapper
-│   │   ├── dedup.py                # Deduplication with TTL
-│   │   ├── storage.py              # SQLite storage layer
-│   │   └── worker.py               # Base worker class
-│   ├── services/
-│   │   └── domain_ranking.py       # FastAPI domain ranking API
-│   └── stages/
-│       ├── scope.py                # Scope management
-│       ├── platforms.py            # HackerOne + Intigriti sync
-│       ├── scheduler.py            # Periodic target re-feed
-│       ├── subdomain.py            # Subdomain enumeration (subfinder + amass + crt.sh + puredns + alterx)
-│       ├── asn_discovery.py        # ASN and CIDR range discovery
-│       ├── cert_discovery.py       # TLS certificate scanning (caduceus)
-│       ├── bbot_discovery.py       # BBOT all-in-one scan
-│       ├── shodan_recon.py         # Shodan signature scanning
-│       ├── github_dorking.py       # GitHub code search dorking
-│       ├── dns_resolve.py          # DNS resolution + takeover detection
-│       ├── portscan.py             # Tiered port scanning (smap -> naabu -> nmap)
-│       ├── httpprobe.py            # HTTP service probing
-│       ├── screenshot.py           # Screenshot capture
-│       ├── crawler.py              # Web crawling
-│       ├── js_keyword_extract.py   # JS keyword extraction + altdns mutation
-│       ├── js_analyze.py           # JavaScript analysis (secrets + endpoints)
-│       └── nuclei_scan.py          # Vulnerability scanning
-└── data/                           # Runtime data (gitignored)
-    ├── bbtrs.db                    # SQLite database
-    ├── screenshots/                # Captured screenshots
-    ├── <domain>/
-    │   └── custom.txt              # Altdns-mutated subdomain candidates
-    └── programs/                   # Per-program exports
-```
+Register in `cli.py` `WORKERS` dict and it's automatically included in `run all`.
 
 ## License
 

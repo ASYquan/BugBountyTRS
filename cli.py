@@ -3,12 +3,12 @@
 
 Usage:
     python3 cli.py scope add <name> --wildcard "*.example.com"
-    python3 cli.py scope sync-h1 <handle>
-    python3 cli.py scope sync-intigriti <company>
-    python3 cli.py run all
-    python3 cli.py run <stage>
+    python3 cli.py scope sync-intigriti <company> [--all]
+    python3 cli.py scope poll-activities [--feed]
+    python3 cli.py run all [--program visma]
+    python3 cli.py run monitor [--interval 3600]
+    python3 cli.py run stage <name>
     python3 cli.py recon subdomains <domain> [-p program] [-o out.txt]
-    python3 cli.py recon crtsh <domain> [--wildcard]
     python3 cli.py recon puredns <domain>
     python3 cli.py recon alterx <input_file>
     python3 cli.py recon asn <domain_or_ip> [--seeds]
@@ -17,8 +17,12 @@ Usage:
     python3 cli.py recon portscan <target> [--passive-only|--fast|--deep]
     python3 cli.py recon bbot <domain> [-P subdomain-enum|kitchen-sink]
     python3 cli.py recon certs <cidr_or_file> [-d domain] [-p ports]
+    python3 cli.py recon content-discovery <url> [-p program]
+    python3 cli.py recon vhost <ip> <apex> [--port 443]
+    python3 cli.py recon takeover <program>
     python3 cli.py status
     python3 cli.py export <program>
+    python3 cli.py export-endpoints <program> [-o out.csv]
     python3 cli.py findings [--severity critical]
 """
 
@@ -144,13 +148,17 @@ def scope_import(file_path, platform):
 
 
 @scope.command("feed")
-def scope_feed():
-    """Push all scope targets into the pipeline for scanning."""
+@click.option("--program", "-p", default=None, help="Only feed targets for this program")
+def scope_feed(program):
+    """Push scope targets into the pipeline for scanning."""
     from pipeline.stages.scope import ScopeManager
     mgr = ScopeManager()
     mgr.load_programs()
-    mgr.feed_targets()
-    console.print("[green]Targets published to pipeline.[/green]")
+    mgr.feed_targets(program_filter=program)
+    if program:
+        console.print(f"[green]Targets for '{program}' published to pipeline.[/green]")
+    else:
+        console.print("[green]All targets published to pipeline.[/green]")
 
 
 @scope.command("sync-h1")
@@ -170,15 +178,67 @@ def scope_sync_h1(handle, api_user, api_token):
 @scope.command("sync-intigriti")
 @click.argument("company")
 @click.option("--program", default=None, help="Specific program handle")
+@click.option("--all", "sync_all", is_flag=True, help="Sync all accessible programs")
 @click.option("--api-token", envvar="INTIGRITI_TOKEN", default=None)
-def scope_sync_intigriti(company, program, api_token):
-    """Sync program scope from Intigriti."""
+def scope_sync_intigriti(company, program, sync_all, api_token):
+    """Sync program scope from Intigriti.
+
+    Use --all to sync every program accessible to your API token.
+    """
     from pipeline.stages.scope import ScopeManager
     from pipeline.stages.platforms import IntigritiSync
     mgr = ScopeManager()
     inti = IntigritiSync(mgr, api_token)
-    inti.sync_program(company, program)
-    console.print(f"[green]Synced Intigriti program: {company}[/green]")
+
+    if sync_all:
+        console.print("[dim]Syncing all accessible Intigriti programs...[/dim]")
+        inti.sync_all_programs()
+        console.print("[green]All programs synced.[/green]")
+    else:
+        inti.sync_program(company, program)
+        console.print(f"[green]Synced Intigriti program: {company}[/green]")
+
+
+@scope.command("poll-activities")
+@click.option("--api-token", envvar="INTIGRITI_TOKEN", default=None)
+@click.option("--feed", is_flag=True, help="Feed newly discovered domains into the pipeline")
+def scope_poll_activities(api_token, feed):
+    """Check Intigriti for scope changes (new domains added/removed).
+
+    Use --feed to automatically push new domains into the pipeline.
+    """
+    from pipeline.stages.scope import ScopeManager
+    from pipeline.stages.platforms import IntigritiSync
+    mgr = ScopeManager()
+    inti = IntigritiSync(mgr, api_token)
+
+    activities = inti.poll_program_activities()
+    new_domains = inti.extract_new_domains_from_activities(activities)
+
+    if not new_domains:
+        console.print("[dim]No new scope changes detected.[/dim]")
+        return
+
+    table = Table(title=f"New Scope Additions ({len(new_domains)})")
+    table.add_column("Program")
+    table.add_column("Domain")
+    table.add_column("Type")
+    for d in new_domains:
+        table.add_row(str(d["program_id"]), d["domain"], str(d["type"]))
+    console.print(table)
+
+    if feed:
+        from pipeline.core.queue import MessageQueue
+        cfg = get_config()
+        mq = MessageQueue("group:scope-poll", "scope-poll")
+        stream = cfg["streams"]["scope_targets"]
+        for d in new_domains:
+            mq.publish(stream, {
+                "domain": d["domain"],
+                "program": str(d["program_id"]),
+                "source": "intigriti_activities",
+            })
+        console.print(f"[green]Fed {len(new_domains)} new domains into pipeline.[/green]")
 
 
 # ─── Recon (one-shot domain discovery) ───────────────────────────
@@ -330,57 +390,58 @@ def recon_alterx(input_file, output):
 def recon_subdomains(domain, program, output, passive_only, no_permutations):
     """Run full subdomain discovery (all tools combined).
 
-    Runs: subfinder + amass + crt.sh + puredns + alterx
+    Runs: subfinder -all + BBOT (parallel) + puredns + alterx
     """
     import subprocess
-    from pipeline.stages.subdomain import crtsh_subdomains, puredns_bruteforce, alterx_permutations
+    import concurrent.futures
+    from pipeline.stages.subdomain import puredns_bruteforce, alterx_permutations
 
     subdomains = set()
     subdomains.add(domain)
 
     # Subfinder
-    console.print("[dim]Running subfinder...[/dim]")
-    try:
+    def _run_subfinder():
         cfg = get_config()["tools"].get("subfinder", {})
-        result = subprocess.run(
-            ["subfinder", "-d", domain, "-silent", "-all",
-             "-t", str(cfg.get("threads", 10)),
-             "-timeout", str(cfg.get("timeout", 30))],
-            capture_output=True, text=True, timeout=300,
-        )
-        sf = {l.strip() for l in result.stdout.splitlines() if l.strip()}
-        subdomains.update(sf)
-        console.print(f"  subfinder: [green]{len(sf)}[/green]")
-    except FileNotFoundError:
-        console.print("  subfinder: [yellow]not installed[/yellow]")
-    except Exception as e:
-        console.print(f"  subfinder: [red]{e}[/red]")
+        try:
+            result = subprocess.run(
+                ["subfinder", "-d", domain, "-silent", "-all",
+                 "-t", str(cfg.get("threads", 10)),
+                 "-timeout", str(cfg.get("timeout", 30))],
+                capture_output=True, text=True, timeout=300,
+            )
+            return {l.strip() for l in result.stdout.splitlines() if l.strip()}, None
+        except FileNotFoundError:
+            return set(), "not installed"
+        except Exception as e:
+            return set(), str(e)
 
-    # Amass
-    console.print("[dim]Running amass passive...[/dim]")
-    try:
-        result = subprocess.run(
-            ["amass", "enum", "-passive", "-d", domain, "-timeout", "5"],
-            capture_output=True, text=True, timeout=600,
-        )
-        am = {l.strip() for l in result.stdout.splitlines() if l.strip()}
-        subdomains.update(am)
-        console.print(f"  amass: [green]{len(am)}[/green]")
-    except FileNotFoundError:
-        console.print("  amass: [yellow]not installed[/yellow]")
-    except Exception as e:
-        console.print(f"  amass: [red]{e}[/red]")
+    # BBOT
+    def _run_bbot():
+        try:
+            from bbot.scanner import Scanner
+            scan = Scanner(domain, presets=["subdomain-enum"])
+            found = set()
+            for event in scan.start():
+                if event.type == "DNS_NAME":
+                    d = str(event.data) if not isinstance(event.data, str) else event.data
+                    found.add(d.lower())
+            return found, None
+        except ImportError:
+            return set(), "not installed"
+        except Exception as e:
+            return set(), str(e)
 
-    # crt.sh
-    console.print("[dim]Querying crt.sh...[/dim]")
-    try:
-        crt = crtsh_subdomains(domain, wildcard=False)
-        crt_wc = crtsh_subdomains(domain, wildcard=True)
-        crt_all = crt | crt_wc
-        subdomains.update(crt_all)
-        console.print(f"  crt.sh: [green]{len(crt_all)}[/green]")
-    except Exception as e:
-        console.print(f"  crt.sh: [red]{e}[/red]")
+    console.print("[dim]Running subfinder + BBOT in parallel...[/dim]")
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+        f_sf = pool.submit(_run_subfinder)
+        f_bb = pool.submit(_run_bbot)
+        sf, sf_err = f_sf.result()
+        bb, bb_err = f_bb.result()
+
+    subdomains.update(sf)
+    console.print(f"  subfinder: [green]{len(sf)}[/green]" + (f" [yellow]({sf_err})[/yellow]" if sf_err else ""))
+    subdomains.update(bb)
+    console.print(f"  bbot: [green]{len(bb)}[/green]" + (f" [yellow]({bb_err})[/yellow]" if bb_err else ""))
 
     passive_count = len(subdomains)
     console.print(f"[bold]Passive total: {passive_count}[/bold]")
@@ -991,22 +1052,45 @@ def recon_certs(target, domain, ports, concurrency, output, json_output, program
 # ─── Pipeline Execution ──────────────────────────────────────────
 
 WORKERS = {
-    "asn_discovery": "pipeline.stages.asn_discovery:ASNDiscoveryWorker",
-    "bbot_discovery": "pipeline.stages.bbot_discovery:BBOTDiscoveryWorker",
-    "cert_discovery": "pipeline.stages.cert_discovery:CertDiscoveryWorker",
-    "subdomain": "pipeline.stages.subdomain:SubdomainWorker",
-    "dns": "pipeline.stages.dns_resolve:DNSResolveWorker",
-    "portscan": "pipeline.stages.portscan:PortScanWorker",
-    "httpprobe": "pipeline.stages.httpprobe:HTTPProbeWorker",
-    "shodan_recon": "pipeline.stages.shodan_recon:ShodanReconWorker",
-    "screenshot": "pipeline.stages.screenshot:ScreenshotWorker",
-    "crawler": "pipeline.stages.crawler:CrawlerWorker",
-    "js_analyze": "pipeline.stages.js_analyze:JSAnalyzeWorker",
-    "js_keywords": "pipeline.stages.js_keyword_extract:JSKeywordWorker",
-    "github_dork": "pipeline.stages.github_dorking:GitHubDorkWorker",
-    "nuclei": "pipeline.stages.nuclei_scan:NucleiScanWorker",
-    "cve_correlate": "pipeline.stages.cve_correlate:CVECorrelateWorker",
-    "finding_filter": "pipeline.stages.finding_filter:FindingFilterWorker",
+    # Scope expansion
+    "apex_discovery":    "pipeline.stages.apex_discovery:ApexDiscoveryWorker",
+    "passive_dns":       "pipeline.stages.passive_dns:PassiveDNSWorker",
+    # Subdomain enumeration
+    "subdomain":         "pipeline.stages.subdomain:SubdomainWorker",
+    "bbot_discovery":    "pipeline.stages.bbot_discovery:BBOTDiscoveryWorker",
+    "asn_discovery":     "pipeline.stages.asn_discovery:ASNDiscoveryWorker",
+    "cert_discovery":    "pipeline.stages.cert_discovery:CertDiscoveryWorker",
+    # Resolution & scanning
+    "dns":               "pipeline.stages.dns_resolve:DNSResolveWorker",
+    "portscan":          "pipeline.stages.portscan:PortScanWorker",
+    "vhost_discovery":   "pipeline.stages.vhost_discovery:VhostDiscoveryWorker",
+    # HTTP
+    "httpprobe":         "pipeline.stages.httpprobe:HTTPProbeWorker",
+    "httpprobe_direct":  "pipeline.stages.httpprobe:HTTPDirectProbeWorker",
+    "content_discovery": "pipeline.stages.content_discovery:ContentDiscoveryWorker",
+    "takeover_check":    "pipeline.stages.takeover_check:TakeoverCheckWorker",
+    # Analysis
+    "shodan_recon":      "pipeline.stages.shodan_recon:ShodanReconWorker",
+    "screenshot":        "pipeline.stages.screenshot:ScreenshotWorker",
+    "crawler":           "pipeline.stages.crawler:CrawlerWorker",
+    "js_analyze":        "pipeline.stages.js_analyze:JSAnalyzeWorker",
+    "js_keywords":       "pipeline.stages.js_keyword_extract:JSKeywordWorker",
+    "github_dork":       "pipeline.stages.github_dorking:GitHubDorkWorker",
+    "nuclei":            "pipeline.stages.nuclei_scan:NucleiScanWorker",
+    "cve_correlate":     "pipeline.stages.cve_correlate:CVECorrelateWorker",
+    "finding_filter":    "pipeline.stages.finding_filter:FindingFilterWorker",
+    "credential_recon":  "pipeline.stages.credential_recon:CredentialReconWorker",
+    "default_cred_scan": "pipeline.stages.credential_recon:DefaultCredScanWorker",
+    # Output
+    "endpoint_csv":        "pipeline.stages.endpoint_csv:EndpointCsvWorker",
+    "endpoint_csv_urls":   "pipeline.stages.endpoint_csv:UrlEndpointCsvWorker",
+    "gsheets_sync":        "pipeline.stages.gsheets_sync:GSheetsWorker",
+    "gsheets_sync_urls":   "pipeline.stages.gsheets_sync:GSheetsUrlWorker",
+    # Attack surface & noise reduction
+    "asset_graph":         "pipeline.stages.asset_graph:AssetGraphWorker",
+    "verb_enum":           "pipeline.stages.verb_enum:VerbEnumWorker",
+    "endpoint_rank":       "pipeline.stages.endpoint_rank:EndpointRankWorker",
+    "forgotten_endpoints": "pipeline.stages.forgotten_endpoints:ForgottenEndpointWorker",
 }
 
 
@@ -1036,11 +1120,36 @@ def run_stage(name):
 
 @run.command("all")
 @click.option("--interval", "-i", default=86400, help="Re-scan interval in seconds (default: 24h)")
-def run_all(interval):
+@click.option("--program", "-p", default=None, help="Only run recon on this program (e.g. visma, nrk)")
+def run_all(interval, program):
     """Run all pipeline stages + scheduler concurrently. Ctrl+C to stop."""
+    import fcntl
+
+    # Prevent multiple instances from running simultaneously — stacked pipelines
+    # contend on the global rate-limit mutex and produce duplicate stream messages.
+    lockfile_path = Path("/tmp/bbtrs.lock")
+    lockfile = open(lockfile_path, "w")
+    try:
+        fcntl.flock(lockfile, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        console.print("[red]Pipeline is already running. Only one instance allowed.[/red]")
+        console.print("[dim]If it crashed, remove /tmp/bbtrs.lock and retry.[/dim]")
+        raise SystemExit(1)
+
+    # ── Orphan cleanup from any previous crashed run ──────────────────────────
+    try:
+        from pipeline.core.ratelimit import kill_orphans_from_previous_run
+        orphans = kill_orphans_from_previous_run()
+        if orphans:
+            console.print(f"[dim]Cleaned up {orphans} orphaned subprocess(es) from previous run.[/dim]")
+    except Exception:
+        pass
+
     console.print("[bold green]Starting BugBountyTRS continuous pipeline...[/bold green]")
     console.print(f"Workers: {', '.join(WORKERS.keys())}")
     console.print(f"Re-scan interval: {interval}s")
+    if program:
+        console.print(f"[yellow]Program filter: {program}[/yellow]")
     console.print("[dim]Press Ctrl+C to stop all workers[/dim]\n")
 
     threads = []
@@ -1049,7 +1158,7 @@ def run_all(interval):
 
     # Start the scheduler first (feeds targets periodically)
     from pipeline.stages.scheduler import Scheduler
-    scheduler = Scheduler(interval=interval)
+    scheduler = Scheduler(interval=interval, program_filter=program)
     sched_thread = threading.Thread(target=scheduler.run, name="scheduler", daemon=True)
     threads.append(sched_thread)
     sched_thread.start()
@@ -1073,6 +1182,34 @@ def run_all(interval):
 
     def _shutdown(sig, frame):
         console.print("\n[yellow]Shutting down workers...[/yellow]")
+
+        # 1. Signal the rate limiter to abort all mutex wait loops immediately.
+        #    This unblocks any worker stuck waiting for active_scan_slot.
+        try:
+            from pipeline.core.ratelimit import _shutdown_event as rl_shutdown
+            rl_shutdown.set()
+        except Exception:
+            pass
+
+        # 2. Kill all active child subprocesses (nmap, naabu, nuclei, httpx, etc.)
+        #    and clear the PID file so they don't show up as orphans on next start.
+        try:
+            from pipeline.core.ratelimit import kill_child_procs
+            killed = kill_child_procs()
+            if killed:
+                console.print(f"[dim]Killed {killed} active subprocess(es).[/dim]")
+        except Exception:
+            pass
+
+        # 3. Delete the mutex NOW so any worker currently holding it releases fast
+        #    and any worker about to acquire it won't wait.
+        try:
+            from pipeline.core.ratelimit import _get_redis
+            _get_redis().delete("roe:active_scan_mutex")
+        except Exception:
+            pass
+
+        # 4. Stop all workers and scheduler.
         scheduler.stop()
         for w in workers:
             w.stop()
@@ -1085,11 +1222,232 @@ def run_all(interval):
     while not stop_event.is_set():
         stop_event.wait(timeout=1)
 
-    # Wait for threads to finish
+    # Join all threads against a single shared deadline (not 10s per thread).
+    # With ~34 daemon threads this avoids a 340-second sequential wait.
+    join_deadline = time.time() + 20
     for t in threads:
-        t.join(timeout=10)
+        remaining = max(0.0, join_deadline - time.time())
+        t.join(timeout=remaining)
+
+    try:
+        fcntl.flock(lockfile, fcntl.LOCK_UN)
+        lockfile.close()
+        lockfile_path.unlink(missing_ok=True)
+    except Exception:
+        pass
 
     console.print("[green]All workers stopped.[/green]")
+
+
+@run.command("monitor")
+@click.option("--interval", "-i", default=3600, help="Poll interval in seconds (default: 1h)")
+@click.option("--api-token", envvar="INTIGRITI_TOKEN", default=None)
+@click.option("--feed", is_flag=True, default=True, help="Auto-feed new domains into pipeline (default: on)")
+def run_monitor(interval, api_token, feed):
+    """Poll Intigriti for scope changes and feed new domains into the pipeline.
+
+    Runs continuously, checking program-activities every INTERVAL seconds.
+    New in-scope domains are automatically pushed to the scope_targets stream.
+    """
+    from pipeline.stages.scope import ScopeManager
+    from pipeline.stages.platforms import IntigritiSync
+
+    console.print(f"[bold green]Starting scope monitor (interval: {interval}s)...[/bold green]")
+    console.print("[dim]Press Ctrl+C to stop[/dim]\n")
+
+    mgr = ScopeManager()
+    stop_event = threading.Event()
+
+    def _shutdown(sig, frame):
+        console.print("\n[yellow]Stopping monitor...[/yellow]")
+        stop_event.set()
+
+    signal.signal(signal.SIGINT, _shutdown)
+    signal.signal(signal.SIGTERM, _shutdown)
+
+    while not stop_event.is_set():
+        try:
+            inti = IntigritiSync(mgr, api_token)
+            activities = inti.poll_program_activities()
+            new_domains = inti.extract_new_domains_from_activities(activities)
+
+            if new_domains:
+                console.print(f"[green]{len(new_domains)} new scope domains detected[/green]")
+                if feed:
+                    cfg = get_config()
+                    mq = MessageQueue("group:monitor", "monitor")
+                    stream = cfg["streams"]["scope_targets"]
+                    for d in new_domains:
+                        mq.publish(stream, {
+                            "domain": d["domain"],
+                            "program": str(d["program_id"]),
+                            "source": "intigriti_monitor",
+                        })
+                    console.print(f"[dim]Fed {len(new_domains)} domains into pipeline[/dim]")
+            else:
+                console.print(f"[dim]{time.strftime('%H:%M:%S')} — No scope changes[/dim]")
+        except Exception as e:
+            console.print(f"[red]Monitor error: {e}[/red]")
+
+        stop_event.wait(timeout=interval)
+
+    console.print("[green]Monitor stopped.[/green]")
+
+
+# ─── New recon commands ───────────────────────────────────────────
+
+@recon.command("content-discovery")
+@click.argument("url")
+@click.option("--program", "-p", default=None, help="Program name")
+@click.option("--wordlist", "-w", default=None, help="Override wordlist path")
+def recon_content_discovery(url, program, wordlist):
+    """Recursive directory bruteforcing with feroxbuster."""
+    import subprocess, tempfile, json as _json
+    from pathlib import Path as _Path
+
+    cfg = get_config().get("content_discovery", {})
+    wl = wordlist or next(
+        (w for w in cfg.get("wordlists", []) if _Path(w).exists()), None
+    )
+    if not wl:
+        console.print("[red]No wordlist found. Set content_discovery.wordlists in config.[/red]")
+        return
+
+    roe = get_config().get("intigriti", {})
+    rate = cfg.get("rate_limit", 20)
+    threads = cfg.get("threads", 10)
+    depth = cfg.get("scan_limit", 3)
+
+    console.print(f"[dim]Running feroxbuster on {url} (rate={rate}/s, depth={depth})...[/dim]")
+
+    with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as tmp:
+        out = tmp.name
+
+    cmd = [
+        "feroxbuster", "--url", url, "--wordlist", wl,
+        "--threads", str(threads), "--rate-limit", str(rate),
+        "--scan-limit", str(depth), "--output", out, "--json",
+        "-A", "-g", "--silent", "--no-state",
+    ]
+    if roe.get("request_header"):
+        k, _, v = roe["request_header"].partition(": ")
+        cmd.extend(["-H", f"{k}: {v}"])
+
+    try:
+        subprocess.run(cmd, timeout=1800)
+        count = 0
+        if _Path(out).exists():
+            with open(out) as f:
+                for line in f:
+                    try:
+                        obj = _json.loads(line)
+                        if obj.get("type") == "response" and obj.get("status", 0) not in (404, 400):
+                            click.echo(f"[{obj.get('status')}] {obj.get('url')}")
+                            count += 1
+                    except Exception:
+                        pass
+            _Path(out).unlink(missing_ok=True)
+        console.print(f"\n[dim]{count} paths found[/dim]")
+    except FileNotFoundError:
+        console.print("[red]feroxbuster not installed.[/red]")
+
+
+@recon.command("vhost")
+@click.argument("ip")
+@click.argument("apex")
+@click.option("--port", default=443, help="Target port (default 443)")
+@click.option("--wordlist", "-w", default=None, help="Override wordlist")
+@click.option("--program", "-p", default=None)
+def recon_vhost(ip, apex, port, wordlist, program):
+    """Discover virtual hosts via Host header fuzzing."""
+    import subprocess, tempfile, json as _json
+    from pathlib import Path as _Path
+
+    cfg = get_config().get("vhost_discovery", {})
+    wl = wordlist or cfg.get("wordlist",
+        "/usr/share/wordlists/SecLists-master/Discovery/DNS/subdomains-top1million-5000.txt"
+    )
+    if not _Path(wl).exists():
+        console.print(f"[red]Wordlist not found: {wl}[/red]")
+        return
+
+    scheme = "https" if int(port) in (443, 8443, 4443) else "http"
+    target = f"{scheme}://{ip}:{port}"
+    rate = cfg.get("rate_limit", 20)
+    roe = get_config().get("intigriti", {})
+
+    console.print(f"[dim]ffuf vhost fuzzing: {target} — Host: FUZZ.{apex}[/dim]")
+
+    with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as tmp:
+        out = tmp.name
+
+    cmd = [
+        "ffuf", "-u", target, "-H", f"Host: FUZZ.{apex}",
+        "-w", wl, "-o", out, "-of", "json",
+        "-rate", str(rate), "-fc", "404,400", "-t", "10", "-s",
+    ]
+    if roe.get("user_agent"):
+        cmd.extend(["-H", f"User-Agent: {roe['user_agent']}"])
+
+    try:
+        subprocess.run(cmd, timeout=600)
+        count = 0
+        if _Path(out).exists():
+            with open(out) as f:
+                try:
+                    data = _json.load(f)
+                    for r in data.get("results", []):
+                        vhost = f"{r['input']['FUZZ']}.{apex}"
+                        click.echo(vhost)
+                        count += 1
+                except Exception:
+                    pass
+            _Path(out).unlink(missing_ok=True)
+        console.print(f"\n[dim]{count} virtual hosts found[/dim]")
+    except FileNotFoundError:
+        console.print("[red]ffuf not installed.[/red]")
+
+
+@recon.command("takeover")
+@click.argument("program_name")
+def recon_takeover(program_name):
+    """Check all subdomains for takeover vulnerabilities (subzy + nuclei)."""
+    import subprocess, tempfile
+    from pathlib import Path as _Path
+
+    storage = Storage()
+    prog = storage.get_program(program_name)
+    if not prog:
+        console.print(f"[red]Program '{program_name}' not found.[/red]")
+        return
+
+    subs = storage.get_subdomains(prog["id"])
+    if not subs:
+        console.print("[yellow]No subdomains found for this program.[/yellow]")
+        return
+
+    console.print(f"[dim]Checking {len(subs)} subdomains for takeover candidates...[/dim]")
+
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False) as tmp:
+        tmp.write("\n".join(s["domain"] for s in subs))
+        hosts_file = tmp.name
+
+    try:
+        result = subprocess.run(
+            ["subzy", "run", "--hosts", hosts_file, "--hide_fails"],
+            capture_output=True, text=True, timeout=300,
+        )
+        found = [l for l in result.stdout.splitlines() if "VULNERABLE" in l.upper()]
+        for line in found:
+            console.print(f"[red bold]{line}[/red bold]")
+        if not found:
+            console.print("[green]No takeover candidates found.[/green]")
+        else:
+            console.print(f"\n[red]{len(found)} takeover candidates found![/red]")
+    except FileNotFoundError:
+        console.print("[yellow]subzy not installed. Run: go install github.com/PentestPad/subzy@latest[/yellow]")
+    finally:
+        _Path(hosts_file).unlink(missing_ok=True)
 
 
 # ─── Pipeline Control ────────────────────────────────────────────
@@ -1153,6 +1511,22 @@ def status():
 
 # ─── Data Export (for Claude Code analysis) ──────────────────────
 
+@cli.command("export-endpoints")
+@click.argument("program_name")
+@click.option("--output", "-o", default=None, help="Output CSV file path")
+def export_endpoints(program_name, output):
+    """Export all discovered HTTP endpoints for a program to CSV."""
+    from pipeline.stages.endpoint_csv import export_program_endpoints
+    from pathlib import Path as _Path
+
+    out_path = _Path(output) if output else None
+    result = export_program_endpoints(program_name, out_path)
+    if result:
+        console.print(f"[green]Exported endpoints to {result}[/green]")
+    else:
+        console.print(f"[yellow]No endpoints found for '{program_name}'.[/yellow]")
+
+
 @cli.command("export")
 @click.argument("program_name")
 @click.option("--output", "-o", default=None, help="Output file path")
@@ -1193,8 +1567,9 @@ def export_all():
 @click.option("--program", "-p", default=None, help="Filter by program name")
 @click.option("--severity", "-s", default=None, help="Filter by severity")
 @click.option("--status", default=None, help="Filter by status (new, reviewed, reported)")
+@click.option("--tool", "-t", default=None, help="Filter by tool (e.g. nuclei, endpoint_rank, takeover_check)")
 @click.option("--limit", "-n", default=50, help="Max results")
-def list_findings(program, severity, status, limit):
+def list_findings(program, severity, status, tool, limit):
     """List vulnerability findings."""
     storage = Storage()
 
@@ -1208,6 +1583,8 @@ def list_findings(program, severity, status, limit):
             return
 
     findings = storage.get_findings(program_id=program_id, severity=severity, status=status)
+    if tool:
+        findings = [f for f in findings if f.get("tool") == tool]
 
     if not findings:
         console.print("[yellow]No findings.[/yellow]")

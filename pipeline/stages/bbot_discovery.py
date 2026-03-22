@@ -19,6 +19,7 @@ import threading
 from ..core.worker import BaseWorker
 from ..core.config import get_config
 from ..core.storage import Storage
+from ..core.ratelimit import _shutdown_event, PipelineShuttingDown
 
 log = logging.getLogger(__name__)
 
@@ -90,7 +91,27 @@ class BBOTDiscoveryWorker(BaseWorker):
 
         # Load BBOT config from our config
         bbot_cfg = get_config().get("bbot", {})
+        inti_cfg = get_config().get("intigriti", {})
         bbot_config = {}
+
+        # Inject Intigriti RoE-required headers into all BBOT HTTP requests
+        http_headers = {}
+        ua = inti_cfg.get("user_agent")
+        if ua:
+            http_headers["User-Agent"] = ua
+        req_header = inti_cfg.get("request_header", "")
+        if req_header and ":" in req_header:
+            hdr_name, hdr_val = req_header.split(":", 1)
+            http_headers[hdr_name.strip()] = hdr_val.strip()
+
+        # Rate limit BBOT's own HTTP activity to stay under Visma RoE 20 req/sec
+        web_rps = bbot_cfg.get("web_rps", 5)
+        bbot_config["web"] = {
+            "http_timeout": bbot_cfg.get("http_timeout", 10),
+            "ratelimit": web_rps,
+        }
+        if http_headers:
+            bbot_config["web"]["http_headers"] = http_headers
 
         # Pass API keys if configured
         api_keys = bbot_cfg.get("api_keys", {})
@@ -99,11 +120,49 @@ class BBOTDiscoveryWorker(BaseWorker):
             for module_name, key in api_keys.items():
                 bbot_config["modules"][module_name] = {"api_key": key}
 
-        # Run the scan synchronously (BBOT handles its own async internally)
+        # Run the scan in a daemon thread so it can be abandoned on shutdown.
+        # BBOT scans are long-running; we must not block the worker loop forever.
         try:
             scan = Scanner(domain, presets=presets, config=bbot_config)
 
-            for event in scan.start():
+            async def _run_async():
+                events = []
+                async for event in scan.async_start():
+                    events.append(event)
+                return events
+
+            collected: list = []
+            exc_holder: list = [None]
+
+            def _scan_thread():
+                try:
+                    # Prefer the async API (BBOT v2+); fall back to sync (v1)
+                    if hasattr(scan, "async_start"):
+                        loop = asyncio.new_event_loop()
+                        try:
+                            collected.extend(loop.run_until_complete(_run_async()))
+                        finally:
+                            loop.close()
+                    else:
+                        collected.extend(list(scan.start()))
+                except Exception as exc:
+                    exc_holder[0] = exc
+
+            t = threading.Thread(target=_scan_thread, daemon=True)
+            t.start()
+
+            # Wait with periodic shutdown checks so Ctrl+C works cleanly.
+            while t.is_alive():
+                if _shutdown_event.is_set():
+                    raise PipelineShuttingDown(f"bbot scan for {domain} interrupted by shutdown")
+                t.join(timeout=0.5)
+
+            if exc_holder[0] is not None:
+                raise exc_holder[0]
+
+            events = collected
+
+            for event in events:
                 event_type = event.type
                 event_data = str(event.data) if not isinstance(event.data, str) else event.data
 
@@ -195,7 +254,19 @@ def bbot_subdomain_enum(domain: str, passive_only: bool = False,
     subdomains = set()
 
     scan = Scanner(domain, presets=presets)
-    for event in scan.start():
+
+    async def _run():
+        results = []
+        async for event in scan.async_start():
+            results.append(event)
+        return results
+
+    if hasattr(scan, "async_start"):
+        events = asyncio.run(_run())
+    else:
+        events = list(scan.start())
+
+    for event in events:
         if event.type == "DNS_NAME":
             subdomains.add(str(event.data))
 
@@ -217,7 +288,19 @@ def bbot_kitchen_sink(domain: str) -> dict:
     }
 
     scan = Scanner(domain, presets=["kitchen-sink"])
-    for event in scan.start():
+
+    async def _run():
+        evts = []
+        async for event in scan.async_start():
+            evts.append(event)
+        return evts
+
+    if hasattr(scan, "async_start"):
+        events = asyncio.run(_run())
+    else:
+        events = list(scan.start())
+
+    for event in events:
         t = event.type
         d = str(event.data) if not isinstance(event.data, str) else event.data
 

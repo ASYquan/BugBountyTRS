@@ -17,6 +17,7 @@ from pathlib import Path
 
 from ..core.worker import BaseWorker
 from ..core.config import get_config
+from ..core.ratelimit import active_scan_slot, tracked_run
 
 log = logging.getLogger(__name__)
 
@@ -39,6 +40,14 @@ class PortScanWorker(BaseWorker):
         if not ip:
             return []
 
+        # Reject garbage values that slipped in from dig error output
+        import ipaddress
+        try:
+            ipaddress.ip_address(ip)
+        except ValueError:
+            log.debug(f"[portscan] Skipping invalid IP: {ip!r}")
+            return []
+
         log.info(f"[portscan] Scanning {ip} ({domain})")
 
         cfg = get_config()["tools"]
@@ -55,48 +64,55 @@ class PortScanWorker(BaseWorker):
                 all_ports[p["port"]] = p
             log.info(f"[portscan] smap (passive): {len(smap_ports)} ports on {ip}")
 
-        # Tier 2: naabu (active fast SYN scan)
-        if "naabu" in tiers:
-            naabu_cfg = cfg.get("naabu", {})
-            naabu_ports = self._run_naabu(ip, naabu_cfg)
-            for p in naabu_ports:
-                if p["port"] not in all_ports:
-                    all_ports[p["port"]] = p
-            log.info(f"[portscan] naabu (active): {len(naabu_ports)} ports on {ip}")
+        # Tiers 2 & 3: active — acquire global scan slot first
+        with active_scan_slot(f"portscan:{ip}"):
+            # Tier 2: naabu (active fast SYN scan)
+            if "naabu" in tiers:
+                naabu_cfg = cfg.get("naabu", {})
+                naabu_ports = self._run_naabu(ip, naabu_cfg)
+                for p in naabu_ports:
+                    if p["port"] not in all_ports:
+                        all_ports[p["port"]] = p
+                log.info(f"[portscan] naabu (active): {len(naabu_ports)} ports on {ip}")
 
-        # Tier 3: nmap (deep — only on discovered ports)
-        if "nmap" in tiers and all_ports:
-            nmap_cfg = cfg.get("nmap", {})
-            port_list = ",".join(str(p) for p in sorted(all_ports.keys()))
-            nmap_ports = self._run_nmap(ip, port_list, nmap_cfg)
-            # Nmap enriches with service/version info
-            for p in nmap_ports:
-                existing = all_ports.get(p["port"], {})
-                # Prefer nmap's richer data
-                existing.update({k: v for k, v in p.items() if v is not None})
-                all_ports[p["port"]] = existing
-            log.info(f"[portscan] nmap (deep): {len(nmap_ports)} ports fingerprinted on {ip}")
-        elif "nmap" in tiers and not all_ports:
-            # Fallback: no ports from smap/naabu, run nmap top-ports
-            nmap_cfg = cfg.get("nmap", {})
-            nmap_ports = self._run_nmap_topports(ip, nmap_cfg)
-            for p in nmap_ports:
-                all_ports[p["port"]] = p
-            log.info(f"[portscan] nmap (fallback top-ports): {len(nmap_ports)} ports on {ip}")
+            # Tier 3: nmap (deep — only on discovered ports)
+            if "nmap" in tiers and all_ports:
+                nmap_cfg = cfg.get("nmap", {})
+                port_list = ",".join(str(p) for p in sorted(all_ports.keys()))
+                nmap_ports = self._run_nmap(ip, port_list, nmap_cfg)
+                # Nmap enriches with service/version info
+                for p in nmap_ports:
+                    existing = all_ports.get(p["port"], {})
+                    # Prefer nmap's richer data
+                    existing.update({k: v for k, v in p.items() if v is not None})
+                    all_ports[p["port"]] = existing
+                log.info(f"[portscan] nmap (deep): {len(nmap_ports)} ports fingerprinted on {ip}")
+            elif "nmap" in tiers and not all_ports:
+                # Fallback: no ports from smap/naabu, run nmap top-ports
+                nmap_cfg = cfg.get("nmap", {})
+                nmap_ports = self._run_nmap_topports(ip, nmap_cfg)
+                for p in nmap_ports:
+                    all_ports[p["port"]] = p
+                log.info(f"[portscan] nmap (fallback top-ports): {len(nmap_ports)} ports on {ip}")
+
+        # Ensure we have a valid subdomain_id before writing ports.
+        # Messages from vhost/cert discovery may carry a None or stale id.
+        subdomain_id = self._resolve_subdomain_id(subdomain_id, program_id, domain)
 
         # Store and publish results
         results = []
         for port_info in all_ports.values():
-            self.storage.upsert_port(
-                subdomain_id=subdomain_id,
-                ip=ip,
-                port=port_info["port"],
-                protocol=port_info.get("protocol", "tcp"),
-                service=port_info.get("service"),
-                banner=port_info.get("banner"),
-                version=port_info.get("version"),
-                state=port_info.get("state", "open"),
-            )
+            if subdomain_id is not None:
+                self.storage.upsert_port(
+                    subdomain_id=subdomain_id,
+                    ip=ip,
+                    port=port_info["port"],
+                    protocol=port_info.get("protocol", "tcp"),
+                    service=port_info.get("service"),
+                    banner=port_info.get("banner"),
+                    version=port_info.get("version"),
+                    state=port_info.get("state", "open"),
+                )
 
             results.append({
                 "program": program,
@@ -114,6 +130,49 @@ class PortScanWorker(BaseWorker):
         log.info(f"[portscan] Total: {len(all_ports)} unique open ports on {ip} ({domain})")
         return results
 
+    def _resolve_subdomain_id(self, subdomain_id, program_id, domain: str):
+        """Return a valid subdomain_id, looking up or creating the row if needed.
+
+        Stream messages from vhost_discovery, cert_discovery, and asset_graph
+        can carry a None or stale subdomain_id. Writing ports with a bad FK
+        causes an IntegrityError. This ensures the subdomains row exists first.
+        """
+        if not domain or not program_id:
+            return subdomain_id
+
+        # Fast path: id was supplied, verify it still exists
+        if subdomain_id is not None:
+            try:
+                with self.storage._conn() as conn:
+                    row = conn.execute(
+                        "SELECT id FROM subdomains WHERE id=?", (subdomain_id,)
+                    ).fetchone()
+                if row:
+                    return subdomain_id
+            except Exception:
+                pass
+
+        # Look up by domain + program
+        try:
+            with self.storage._conn() as conn:
+                row = conn.execute(
+                    "SELECT id FROM subdomains WHERE program_id=? AND domain=?",
+                    (program_id, domain),
+                ).fetchone()
+            if row:
+                return row["id"]
+        except Exception:
+            pass
+
+        # Not in DB yet — upsert it so the FK can succeed
+        try:
+            return self.storage.upsert_subdomain(
+                int(program_id), domain, source="portscan"
+            )
+        except Exception as e:
+            log.debug(f"[portscan] Could not resolve subdomain_id for {domain}: {e}")
+            return None
+
     # ─── Tier 1: smap (passive via Shodan InternetDB) ────────────
 
     def _run_smap(self, target: str) -> list[dict]:
@@ -122,7 +181,7 @@ class PortScanWorker(BaseWorker):
 
         # Try smap binary first
         try:
-            result = subprocess.run(
+            result = tracked_run(
                 ["smap", "-oJ", "-", target],
                 capture_output=True, text=True, timeout=30,
             )
@@ -170,8 +229,8 @@ class PortScanWorker(BaseWorker):
     def _run_naabu(self, target: str, cfg: dict) -> list[dict]:
         """Fast port discovery with naabu. SYN scan if root, CONNECT otherwise."""
         ports = []
-        rate = cfg.get("rate", 1000)
-        threads = cfg.get("threads", 25)
+        rate = cfg.get("rate", 20)
+        threads = cfg.get("threads", 5)
         top_ports = cfg.get("top_ports", 1000)
         exclude_cdn = cfg.get("exclude_cdn", True)
 
@@ -189,7 +248,7 @@ class PortScanWorker(BaseWorker):
             cmd.append("-exclude-cdn")
 
         try:
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+            result = tracked_run(cmd, capture_output=True, text=True, timeout=300)
             for line in result.stdout.strip().splitlines():
                 line = line.strip()
                 if not line:
@@ -228,8 +287,8 @@ class PortScanWorker(BaseWorker):
 
     def _run_nmap(self, target: str, port_list: str, cfg: dict) -> list[dict]:
         """Run nmap service detection only on known-open ports."""
-        rate = cfg.get("rate", 1000)
-        scripts = cfg.get("scripts", "default,vuln")
+        rate = cfg.get("rate", 20)
+        scripts = cfg.get("scripts", "default,safe")
 
         with tempfile.NamedTemporaryFile(suffix=".xml", delete=False) as tmp:
             xml_path = tmp.name
@@ -244,7 +303,7 @@ class PortScanWorker(BaseWorker):
                 "-oX", xml_path,
                 target,
             ]
-            subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+            tracked_run(cmd, capture_output=True, text=True, timeout=600)
             return self._parse_nmap_xml(xml_path)
         except FileNotFoundError:
             log.debug("nmap not found, skipping tier 3")
@@ -258,7 +317,7 @@ class PortScanWorker(BaseWorker):
     def _run_nmap_topports(self, target: str, cfg: dict) -> list[dict]:
         """Fallback: run nmap top-ports when no ports found by other tiers."""
         top_ports = cfg.get("top_ports", 1000)
-        rate = cfg.get("rate", 1000)
+        rate = cfg.get("rate", 20)
 
         with tempfile.NamedTemporaryFile(suffix=".xml", delete=False) as tmp:
             xml_path = tmp.name
@@ -272,7 +331,7 @@ class PortScanWorker(BaseWorker):
                 "-oX", xml_path,
                 target,
             ]
-            subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+            tracked_run(cmd, capture_output=True, text=True, timeout=600)
             return self._parse_nmap_xml(xml_path)
         except FileNotFoundError:
             log.error("nmap not found")

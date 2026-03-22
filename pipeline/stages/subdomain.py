@@ -4,20 +4,26 @@ Consumes root domains from scope_targets stream.
 Runs multiple passive and active enumeration tools and feeds discovered
 subdomains into the recon_subdomains stream.
 
-Tools used:
-  - subfinder (passive)
-  - amass passive (passive)
-  - crt.sh certificate transparency (passive)
-  - puredns brute-force (active, optional)
-  - alterx permutation generation + resolution (active, optional)
+Tools used (passive):
+  - subfinder -all (multi-source, with API key stacking)
+  - bbot (finds ~5-8% more than subfinder, run in parallel)
+  - SNI data from kaeferjaeger.gay (pre-scanned cloud cert data)
+
+Tools used (active, optional):
+  - puredns bruteforce (DNS brute-force)
+  - alterx -enrich + puredns resolve (permutation generation)
+
+Removed (deprecated):
+  - crt.sh: broken pagination, misses certs with any errors (~40% data loss)
+  - amass: too slow, replaced by subfinder + bbot combination
 """
 
-import json
+import re
 import subprocess
+from ..core.ratelimit import tracked_run
 import logging
 import tempfile
 from pathlib import Path
-from urllib.parse import quote
 
 from ..core.worker import BaseWorker
 from ..core.config import get_config
@@ -46,24 +52,29 @@ class SubdomainWorker(BaseWorker):
         subdomains = set()
         cfg = get_config()["tools"].get("subdomain_discovery", {})
 
-        # --- Passive sources ---
-        sf_results = self._run_subfinder(domain)
+        # --- Passive sources (run subfinder + bbot in parallel via threads) ---
+        import concurrent.futures
+        with concurrent.futures.ThreadPoolExecutor(max_workers=3) as pool:
+            f_subfinder = pool.submit(self._run_subfinder, domain)
+            f_bbot = pool.submit(self._run_bbot, domain)
+            f_sni = pool.submit(self._run_sni_lookup, domain)
+
+        sf_results = f_subfinder.result()
+        bbot_results = f_bbot.result()
+        sni_results = f_sni.result()
+
         subdomains.update(sf_results)
-
-        amass_results = self._run_amass_passive(domain)
-        subdomains.update(amass_results)
-
-        crtsh_results = self._run_crtsh(domain)
-        subdomains.update(crtsh_results)
-
-        crtsh_wc = self._run_crtsh_wildcard(domain)
-        subdomains.update(crtsh_wc)
+        subdomains.update(bbot_results)
+        subdomains.update(sni_results)
 
         # Always include the root domain itself
         subdomains.add(domain)
 
         passive_count = len(subdomains)
-        log.info(f"[subdomain] Passive: {passive_count} subdomains for {domain}")
+        log.info(
+            f"[subdomain] Passive: {passive_count} subdomains for {domain} "
+            f"(subfinder={len(sf_results)}, bbot={len(bbot_results)}, sni={len(sni_results)})"
+        )
 
         # --- Active: puredns brute-force (if enabled) ---
         if cfg.get("puredns_enabled", True):
@@ -92,10 +103,10 @@ class SubdomainWorker(BaseWorker):
                 source = self._subfinder_sources[sub]
             elif sub in sf_results:
                 source = "subfinder"
-            elif sub in amass_results:
-                source = "amass"
-            elif sub in crtsh_results or sub in crtsh_wc:
-                source = "crtsh"
+            elif sub in bbot_results:
+                source = "bbot"
+            elif sub in sni_results:
+                source = "sni"
             else:
                 source = "active"
 
@@ -129,7 +140,7 @@ class SubdomainWorker(BaseWorker):
             cmd.append("-cs")  # Show source per subdomain (sub,source format)
 
         try:
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+            result = tracked_run(cmd, capture_output=True, text=True, timeout=300)
             subs = set()
             self._subfinder_sources = {}  # sub -> source mapping
 
@@ -158,75 +169,148 @@ class SubdomainWorker(BaseWorker):
             log.warning(f"subfinder timed out for {domain}")
             return set()
 
-    # ─── Passive: amass ─────────────────────────────────────────
+    # ─── Passive: bbot ──────────────────────────────────────────
 
-    def _run_amass_passive(self, domain: str) -> set[str]:
+    def _run_bbot(self, domain: str) -> set[str]:
+        """Run BBOT for subdomain discovery.
+
+        BBOT finds ~5-8% more subdomains than subfinder alone.
+        Outputs to a temp directory and parses the subdomains.
+        """
+        cfg = get_config().get("bbot", {})
+        preset = cfg.get("preset", "subdomain-enum")
+
         try:
-            result = subprocess.run(
-                [
-                    "amass", "enum", "-passive",
-                    "-d", domain,
-                    "-timeout", "5",
-                ],
-                capture_output=True, text=True, timeout=600,
-            )
-            return {line.strip() for line in result.stdout.splitlines() if line.strip()}
+            with tempfile.TemporaryDirectory() as tmp_dir:
+                out_file = Path(tmp_dir) / "subdomains.txt"
+                result = tracked_run(
+                    [
+                        "bbot",
+                        "-t", domain,
+                        "-p", preset,
+                        "--silent",
+                        "-o", tmp_dir,
+                        "-om", "txt",
+                        "--allow-deadly",
+                    ],
+                    capture_output=True, text=True, timeout=600,
+                    cwd=tmp_dir,
+                )
+
+                subs = set()
+                # bbot writes subdomains to stdout in silent mode
+                for line in result.stdout.splitlines():
+                    line = line.strip().lower()
+                    if line and not line.startswith("[") and "." in line:
+                        # Basic domain validation
+                        if re.match(r"^[a-zA-Z0-9\-\.]+\.[a-zA-Z]{2,}$", line):
+                            subs.add(line)
+
+                # Also check output file if it exists
+                for txt_file in Path(tmp_dir).glob("**/*.txt"):
+                    try:
+                        with open(txt_file) as f:
+                            for line in f:
+                                line = line.strip().lower()
+                                if line and "." in line:
+                                    if re.match(r"^[a-zA-Z0-9\-\.]+\.[a-zA-Z]{2,}$", line):
+                                        subs.add(line)
+                    except Exception:
+                        pass
+
+                log.info(f"[subdomain] bbot: {len(subs)} subs for {domain}")
+                return subs
         except FileNotFoundError:
-            log.debug("amass not found, skipping")
+            log.debug("bbot not found, skipping")
             return set()
         except subprocess.TimeoutExpired:
-            log.warning(f"amass timed out for {domain}")
+            log.warning(f"bbot timed out for {domain}")
+            return set()
+        except Exception as e:
+            log.warning(f"bbot failed for {domain}: {e}")
             return set()
 
-    # ─── Passive: crt.sh ────────────────────────────────────────
+    # ─── Passive: SNI / kaeferjaeger cloud cert data ─────────────
 
-    def _run_crtsh(self, domain: str) -> set[str]:
-        """Scrape crt.sh for non-wildcard subdomains."""
+    def _run_sni_lookup(self, domain: str) -> set[str]:
+        """Query kaeferjaeger.gay pre-scanned TLS/SNI data.
+
+        This dataset contains SSL certificate metadata from scans of all major
+        cloud provider IP ranges (AWS, GCP, Azure, Cloudflare, etc.), updated
+        every ~30 days. Finds subdomains hosted on cloud without touching the target.
+        """
+        script = Path(get_config().get("apex_discovery", {}).get(
+            "tenant_domains_script", "./scripts/tenant_domains.sh"
+        )).parent / "sni_lookup.sh"
+
+        # Use the existing sni_lookup.sh script if available
+        if script.exists():
+            try:
+                result = tracked_run(
+                    ["bash", str(script), "-d", domain],
+                    capture_output=True, text=True, timeout=300,
+                )
+                subs = set()
+                for line in result.stdout.splitlines():
+                    line = line.strip().lower()
+                    if line and "." in line and domain in line:
+                        subs.add(line)
+                log.info(f"[subdomain] SNI lookup: {len(subs)} subs for {domain}")
+                return subs
+            except Exception as e:
+                log.debug(f"SNI lookup failed: {e}")
+                return set()
+
+        # Fallback: direct HTTP query to kaeferjaeger index
         try:
             import urllib.request
-            url = f"https://crt.sh/json?identity={quote(domain)}&exclude=expired"
-            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-            with urllib.request.urlopen(req, timeout=30) as resp:
-                data = json.loads(resp.read().decode())
+            import gzip
+            import io
+
+            cache_dir = Path.home() / ".cache" / "bbtrs" / "sni-data"
+            cache_dir.mkdir(parents=True, exist_ok=True)
+
+            index_url = "https://kaeferjaeger.gay/sni-ip-ranges/index.txt"
+            req = urllib.request.Request(index_url, headers={"User-Agent": "Mozilla/5.0"})
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                index = resp.read().decode().splitlines()
 
             subs = set()
-            for entry in data:
-                name_value = entry.get("name_value", "")
-                for name in name_value.split("\n"):
-                    name = name.strip().lower()
-                    if name and not name.startswith("*.") and name != domain:
-                        subs.add(name)
+            for fname in index[:5]:  # Limit to first 5 files to avoid excessive download
+                fname = fname.strip()
+                if not fname:
+                    continue
+                cache_file = cache_dir / fname
+                if not cache_file.exists():
+                    try:
+                        dl_url = f"https://kaeferjaeger.gay/sni-ip-ranges/{fname}"
+                        with urllib.request.urlopen(urllib.request.Request(dl_url, headers={"User-Agent": "Mozilla/5.0"}), timeout=30) as r:
+                            data = r.read()
+                        with open(cache_file, "wb") as f:
+                            f.write(data)
+                    except Exception:
+                        continue
 
-            log.info(f"[subdomain] crt.sh: {len(subs)} non-wildcard subs for {domain}")
+                try:
+                    opener = gzip.open if fname.endswith(".gz") else open
+                    with opener(cache_file, "rt", errors="ignore") as f:
+                        for line in f:
+                            if domain in line:
+                                # Format: "IP -- [host1, host2, ...]"
+                                parts = line.split("--", 1)
+                                if len(parts) == 2:
+                                    hosts_part = parts[1].strip().strip("[]")
+                                    for h in hosts_part.split(","):
+                                        h = h.strip().strip("'\"").lower()
+                                        if h.endswith(f".{domain}") or h == domain:
+                                            subs.add(h)
+                except Exception:
+                    continue
+
+            log.info(f"[subdomain] SNI fallback: {len(subs)} subs for {domain}")
             return subs
         except Exception as e:
-            log.warning(f"crt.sh query failed for {domain}: {e}")
-            return set()
-
-    def _run_crtsh_wildcard(self, domain: str) -> set[str]:
-        """Scrape crt.sh for wildcard subdomains (strips *. prefix)."""
-        try:
-            import urllib.request
-            url = f"https://crt.sh/json?identity={quote(domain)}&exclude=expired"
-            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-            with urllib.request.urlopen(req, timeout=30) as resp:
-                data = json.loads(resp.read().decode())
-
-            subs = set()
-            for entry in data:
-                for field in ("name_value", "common_name"):
-                    val = entry.get(field, "") or ""
-                    for name in val.split("\n"):
-                        name = name.strip().lower()
-                        if name.startswith("*."):
-                            stripped = name[2:].rstrip(".")
-                            if stripped and stripped != domain:
-                                subs.add(stripped)
-
-            log.info(f"[subdomain] crt.sh wildcard: {len(subs)} subs for {domain}")
-            return subs
-        except Exception as e:
-            log.warning(f"crt.sh wildcard query failed for {domain}: {e}")
+            log.debug(f"SNI fallback failed for {domain}: {e}")
             return set()
 
     # ─── Active: puredns brute-force ────────────────────────────
@@ -257,7 +341,7 @@ class SubdomainWorker(BaseWorker):
             if Path(resolvers).exists():
                 cmd.extend(["--resolvers", resolvers])
 
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=1800)
+            result = tracked_run(cmd, capture_output=True, text=True, timeout=1800)
 
             subs = set()
             if Path(tmp_path).exists():
@@ -280,7 +364,7 @@ class SubdomainWorker(BaseWorker):
         """Generate subdomain permutations using alterx."""
         try:
             input_text = "\n".join(known_subs)
-            result = subprocess.run(
+            result = tracked_run(
                 ["alterx", "-enrich"],
                 input=input_text,
                 capture_output=True, text=True, timeout=300,
@@ -318,7 +402,7 @@ class SubdomainWorker(BaseWorker):
             if Path(resolvers).exists():
                 cmd.extend(["--resolvers", resolvers])
 
-            subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+            tracked_run(cmd, capture_output=True, text=True, timeout=600)
 
             resolved = set()
             if Path(tmp_out_path).exists():
@@ -334,48 +418,25 @@ class SubdomainWorker(BaseWorker):
         except FileNotFoundError:
             log.warning("puredns not found for permutation resolution, skipping")
             Path(tmp_in_path).unlink(missing_ok=True)
+            Path(tmp_out_path).unlink(missing_ok=True)
             return set()
         except subprocess.TimeoutExpired:
             log.warning("permutation resolution timed out")
+            Path(tmp_in_path).unlink(missing_ok=True)
+            Path(tmp_out_path).unlink(missing_ok=True)
             return set()
         except Exception as e:
             log.warning(f"permutation resolution failed: {e}")
+            Path(tmp_in_path).unlink(missing_ok=True)
+            Path(tmp_out_path).unlink(missing_ok=True)
             return set()
 
 
 # ─── Standalone one-shot functions (used by CLI recon commands) ──
 
 
-def crtsh_subdomains(domain: str, wildcard: bool = False) -> set[str]:
-    """Query crt.sh for subdomains. Returns a set of domains."""
-    import urllib.request
-    url = f"https://crt.sh/json?identity={quote(domain)}&exclude=expired"
-    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-    with urllib.request.urlopen(req, timeout=30) as resp:
-        data = json.loads(resp.read().decode())
-
-    subs = set()
-    for entry in data:
-        if wildcard:
-            for field in ("name_value", "common_name"):
-                val = entry.get(field, "") or ""
-                for name in val.split("\n"):
-                    name = name.strip().lower()
-                    if name.startswith("*."):
-                        subs.add(name[2:].rstrip("."))
-        else:
-            name_value = entry.get("name_value", "")
-            for name in name_value.split("\n"):
-                name = name.strip().lower()
-                if name and not name.startswith("*."):
-                    subs.add(name)
-
-    subs.discard(domain)
-    return subs
-
-
 def puredns_bruteforce(domain: str, wordlist: str = None, resolvers: str = None,
-                       rate_limit: int = 1000, rate_limit_trusted: int = 300) -> set[str]:
+                       rate_limit: int = 150, rate_limit_trusted: int = 50) -> set[str]:
     """Run puredns brute-force and return found subdomains."""
     wordlist = wordlist or "/usr/share/wordlists/SecLists-master/Discovery/DNS/dns-Jhaddix.txt"
     resolvers = resolvers or "/usr/share/wordlists/resolvers.txt"
@@ -392,7 +453,7 @@ def puredns_bruteforce(domain: str, wordlist: str = None, resolvers: str = None,
     if Path(resolvers).exists():
         cmd.extend(["--resolvers", resolvers])
 
-    subprocess.run(cmd, capture_output=True, text=True, timeout=1800)
+    tracked_run(cmd, capture_output=True, text=True, timeout=1800)
 
     subs = set()
     if Path(tmp_path).exists():
@@ -405,7 +466,7 @@ def puredns_bruteforce(domain: str, wordlist: str = None, resolvers: str = None,
 def alterx_permutations(subdomains: list[str]) -> set[str]:
     """Generate permutations from known subdomains using alterx."""
     input_text = "\n".join(subdomains)
-    result = subprocess.run(
+    result = tracked_run(
         ["alterx", "-enrich"],
         input=input_text,
         capture_output=True, text=True, timeout=300,

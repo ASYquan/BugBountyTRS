@@ -29,26 +29,41 @@ class ScopeManager:
 
     def add_program(self, name: str, platform: str = None, url: str = None,
                     wildcards: list[str] = None, domains: list[str] = None,
-                    excludes: list[str] = None):
+                    excludes: list[str] = None, roe: dict = None):
         """Add or update a bug bounty program."""
         scope = {
             "wildcards": wildcards or [],
             "domains": domains or [],
             "excludes": excludes or [],
         }
-        program_id = self.storage.upsert_program(name, platform, url, scope)
+        program_id = self.storage.upsert_program(name, platform, url, scope, roe=roe)
 
-        # Save scope file
+        # Save scope file (preserve existing roe block if not provided)
         scope_dir = self.programs_dir / name
         scope_dir.mkdir(parents=True, exist_ok=True)
         scope_file = scope_dir / "scope.yml"
+
+        # Load existing file to preserve roe/contact fields not passed via args
+        existing = {}
+        if scope_file.exists():
+            with open(scope_file) as f:
+                existing = yaml.safe_load(f) or {}
+
+        file_data = {
+            "name": name,
+            "platform": platform,
+            "url": url,
+            "scope": scope,
+        }
+        # Preserve extra top-level keys (contact, pgp_fingerprint, roe)
+        for extra_key in ("contact", "pgp_fingerprint", "roe"):
+            if roe and extra_key == "roe":
+                file_data["roe"] = roe
+            elif extra_key in existing:
+                file_data[extra_key] = existing[extra_key]
+
         with open(scope_file, "w") as f:
-            yaml.dump({
-                "name": name,
-                "platform": platform,
-                "url": url,
-                "scope": scope,
-            }, f, default_flow_style=False)
+            yaml.dump(file_data, f, default_flow_style=False)
 
         # Build regex patterns
         self._compile_scope(name, scope)
@@ -69,6 +84,7 @@ class ScopeManager:
                     wildcards=data.get("scope", {}).get("wildcards", []),
                     domains=data.get("scope", {}).get("domains", []),
                     excludes=data.get("scope", {}).get("excludes", []),
+                    roe=data.get("roe"),
                 )
 
     def _compile_scope(self, name: str, scope: dict):
@@ -109,13 +125,20 @@ class ScopeManager:
 
         return False, None
 
-    def feed_targets(self):
-        """Publish all known in-scope domains to the pipeline for scanning."""
+    def feed_targets(self, program_filter: str = None):
+        """Publish known in-scope domains to the pipeline for scanning.
+
+        Args:
+            program_filter: If set, only feed targets for this program name.
+        """
         stream = self.mq.stream_name("scope_targets")
 
         for program in self.storage.list_programs():
             pid = program["id"]
             pname = program["name"]
+
+            if program_filter and pname.lower() != program_filter.lower():
+                continue
 
             # Feed wildcard root domains for subdomain enumeration
             prog = self.storage.get_program(pname)
