@@ -93,8 +93,8 @@ run_scan() {
             -ports "$PORTS" \
             -no-fallback \
             -probe-all-ips \
-            -H "User-Agent: Intigriti-asquan-Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/90.0.4430.212 Safari/537.36" \
-            -H "X-Bug-Bounty: Intigriti-asquan" \
+            -H "User-Agent: Intigriti-${INTIGRITI_USERNAME:-YOUR_USERNAME}-Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/90.0.4430.212 Safari/537.36" \
+            -H "X-Bug-Bounty: Intigriti-${INTIGRITI_USERNAME:-YOUR_USERNAME}" \
             -o "$outfile" \
             -oa || {
         echo "[!] Warning: scan failed for $target" >&2

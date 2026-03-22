@@ -102,8 +102,8 @@ run_ferox() {
     if [[ "$RANDOM_AGENT" == true ]]; then
         args+=(-A)
     else
-        args+=(-a "Intigriti-asquan-Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/90.0.4430.212 Safari/537.36")
-        args+=(-H "X-Bug-Bounty: Intigriti-asquan")
+        args+=(-a "Intigriti-${INTIGRITI_USERNAME:-YOUR_USERNAME}-Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/90.0.4430.212 Safari/537.36")
+        args+=(-H "X-Bug-Bounty: Intigriti-${INTIGRITI_USERNAME:-YOUR_USERNAME}")
     fi
 
     if [[ "$COLLECT_LINKS" == true ]]; then
