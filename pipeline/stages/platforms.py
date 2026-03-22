@@ -133,16 +133,20 @@ class IntigritiSync:
         """
         raw_roe = None
 
-        # Try embedded RoE in program detail response
+        # Try embedded RoE in program detail response.
+        # Real API structure: rulesOfEngagement.content.{description, testingRequirements, safeHarbour}
         if program_data:
-            raw_roe = (
-                program_data.get("rulesOfEngagements")
-                or program_data.get("rulesOfEngagement")
+            embedded = (
+                program_data.get("rulesOfEngagement")
+                or program_data.get("rulesOfEngagements")
                 or program_data.get("roe")
             )
+            if isinstance(embedded, dict):
+                # Unwrap version wrapper — content is the actual RoE
+                raw_roe = embedded.get("content") or embedded
 
-        # If embedded gave us only a reference (has an id/latestVersion), fetch the full doc
-        if isinstance(raw_roe, dict) and not raw_roe.get("description"):
+        # If we only got a reference (has id but no testingRequirements), fetch the full doc
+        if isinstance(raw_roe, dict) and not raw_roe.get("testingRequirements") and not raw_roe.get("content"):
             version_id = (
                 raw_roe.get("id")
                 or (raw_roe.get("latestVersion") or {}).get("id")
@@ -190,36 +194,38 @@ class IntigritiSync:
           no_subdomain_enum       - bool: disable subdomain enumeration
           raw                     - original API response
         """
-        testing = raw.get("testingRequirements") or {}
-
-        # Required headers
-        headers = {}
-        for h in (testing.get("requestHeaders") or []):
-            name = h.get("name") or h.get("key") or ""
-            value = h.get("value") or ""
-            if name:
-                headers[name] = value
-
-        # Automated scanning stance
-        auto_raw = (
-            testing.get("automatedTooling")
-            or testing.get("automatedScanning")
-            or testing.get("automated")
-            or ""
-        )
-        auto_raw = str(auto_raw).lower()
-        if "not" in auto_raw or "disallow" in auto_raw or auto_raw == "false":
-            automated = "not_allowed"
-        elif "restrict" in auto_raw or "limit" in auto_raw:
-            automated = "restricted"
+        # The API nests content under a 'content' key in the version wrapper.
+        # Support both the wrapped form and the unwrapped form.
+        if "content" in raw and isinstance(raw["content"], dict):
+            content = raw["content"]
         else:
+            content = raw
+
+        testing = content.get("testingRequirements") or {}
+
+        # automatedTooling is an integer req/sec rate limit (not an enum).
+        # Confirmed from real API: Visma=20, Signicat=5, Canada Post=1, null=unspecified.
+        # 0 = not allowed, null = no restriction stated (use conservative default).
+        auto_tooling = testing.get("automatedTooling")
+        if auto_tooling is None:
+            rate_limit = 20          # unspecified — use conservative default
             automated = "allowed"
+        elif int(auto_tooling) == 0:
+            rate_limit = 0
+            automated = "not_allowed"
+        else:
+            rate_limit = int(auto_tooling)
+            automated = "restricted" if rate_limit <= 5 else "allowed"
 
-        # Rate limit — Intigriti doesn't always specify one explicitly;
-        # default to 20 req/sec (Visma-level conservative)
-        rate_limit = int(testing.get("rateLimit") or testing.get("maxRequestsPerSecond") or 20)
+        # requestHeader is a plain string "Name: Value" (not an array)
+        headers = {}
+        req_header = testing.get("requestHeader") or ""
+        if req_header:
+            k, _, v = req_header.partition(":")
+            if k.strip():
+                headers[k.strip()] = v.strip()
 
-        description = raw.get("description") or ""
+        description = content.get("description") or ""
         flags = IntigritiSync._parse_description_flags(description)
 
         return {
@@ -228,7 +234,7 @@ class IntigritiSync:
             "required_headers": headers,
             "required_user_agent": testing.get("userAgent") or testing.get("user_agent"),
             "intigriti_me_required": bool(testing.get("intigritiMe") or testing.get("intigriti_me")),
-            "safe_harbour": bool(raw.get("safeHarbour") or raw.get("safe_harbour") or raw.get("safeHarbor")),
+            "safe_harbour": bool(content.get("safeHarbour") or content.get("safe_harbour") or content.get("safeHarbor")),
             "description": description,
             **flags,
             "raw": raw,

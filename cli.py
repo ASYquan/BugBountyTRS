@@ -270,6 +270,23 @@ def scope_roe(program, fetch, api_token):
 
     console.print(table)
 
+    # ── Feature flags derived from description keyword scan ────────
+    flags = {
+        "no_subdomain_enum":  ("Subdomain enumeration",  "blocked"),
+        "no_portscan":        ("Port scanning",           "blocked"),
+        "no_bruteforce":      ("Brute-force / fuzzing",   "blocked"),
+        "no_vuln_scan":       ("Vulnerability scanning",  "blocked"),
+        "web_only":           ("Scope",                   "web only (no infra scanning)"),
+    }
+    active_flags = [(label, note) for key, (label, note) in flags.items() if roe.get(key)]
+    if active_flags:
+        flag_table = Table(title="Scanning Restrictions (from policy text)", show_header=False, box=None)
+        flag_table.add_column("Technique", style="bold yellow", width=28)
+        flag_table.add_column("Status")
+        for label, note in active_flags:
+            flag_table.add_row(label, f"[red]{note}[/red]")
+        console.print(flag_table)
+
     desc = roe.get("description", "").strip()
     if desc:
         console.print(Panel(desc, title="Policy Description", border_style="dim"))

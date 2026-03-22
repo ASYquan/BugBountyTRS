@@ -79,13 +79,16 @@ class ForgottenEndpointWorker(BaseWorker):
             return []
 
         # Not found by active sources — probe it
-        roe = self.get_program_roe(program_id)
-        rate_limit = roe.get("max_rate", 20)
+        constraints = self.roe_constraints(data)
+        if not self.is_scanning_allowed(constraints, "forgotten_endpoints"):
+            return []
+
+        rate_limit = constraints["rate_limit_rps"]
 
         log.info(f"[forgotten] Probing historical URL not in current crawl: {url}")
 
         with active_scan_slot(program_id):
-            status, length, title = self._probe(url, rate_limit=rate_limit)
+            status, length, title = self._probe(url, rate_limit=rate_limit, constraints=constraints)
 
         if status is None:
             return []
@@ -140,13 +143,8 @@ class ForgottenEndpointWorker(BaseWorker):
         except Exception:
             return False
 
-    def _probe(self, url: str, rate_limit: int = 20) -> tuple:
+    def _probe(self, url: str, rate_limit: int = 20, constraints: dict = None) -> tuple:
         """Probe URL with httpx. Returns (status_code, content_length, title)."""
-        cfg = get_config()
-        inti_cfg = cfg.get("intigriti", {})
-        ua = inti_cfg.get("user_agent", "Mozilla/5.0")
-        req_header = inti_cfg.get("request_header", "")
-
         cmd = [
             "httpx",
             "-u", url,
@@ -157,10 +155,18 @@ class ForgottenEndpointWorker(BaseWorker):
             "-silent",
             "-timeout", "10",
             "-rl", str(rate_limit),
-            "-H", f"User-Agent: {ua}",
         ]
-        if req_header:
-            cmd.extend(["-H", req_header])
+        if constraints:
+            cmd.extend(self.roe_header_args(constraints))
+        else:
+            # Fallback to config-level headers when no constraints provided
+            cfg = get_config()
+            inti_cfg = cfg.get("intigriti", {})
+            ua = inti_cfg.get("user_agent", "Mozilla/5.0")
+            req_header = inti_cfg.get("request_header", "")
+            cmd.extend(["-H", f"User-Agent: {ua}"])
+            if req_header:
+                cmd.extend(["-H", req_header])
 
         try:
             out = subprocess.run(
