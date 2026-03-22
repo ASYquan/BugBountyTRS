@@ -226,6 +226,8 @@ class IntigritiSync:
         if req_header:
             if username:
                 req_header = req_header.replace("<username>", username)
+                req_header = req_header.replace("{Username}", username)
+                req_header = req_header.replace("{username}", username)
             k, _, v = req_header.partition(":")
             if k.strip():
                 headers[k.strip()] = v.strip()
