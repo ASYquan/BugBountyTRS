@@ -63,10 +63,14 @@ class VhostDiscoveryWorker(BaseWorker):
 
         log.info(f"[vhost] Fuzzing {ip}:{port} for virtual hosts ({len(apex_domains)} apex domains)")
 
+        constraints = self.roe_constraints(data)
+        if not self.is_scanning_allowed(constraints, "vhost_discovery"):
+            return []
+
         discovered = []
         with active_scan_slot("ffuf_vhost"):
             for apex in apex_domains:
-                vhosts = self._run_ffuf_vhost(target_url, apex, cfg)
+                vhosts = self._run_ffuf_vhost(target_url, apex, cfg, constraints=constraints)
                 for vhost in vhosts:
                     self.storage.upsert_vhost(program_id, ip, vhost, port=port_int)
                     discovered.append({
@@ -84,19 +88,19 @@ class VhostDiscoveryWorker(BaseWorker):
 
         return discovered
 
-    def _run_ffuf_vhost(self, target_url: str, apex: str, cfg: dict) -> set[str]:
+    def _run_ffuf_vhost(self, target_url: str, apex: str, cfg: dict,
+                        constraints: dict = None) -> set[str]:
         wordlist = cfg.get("wordlist",
             "/usr/share/wordlists/SecLists-master/Discovery/DNS/subdomains-top1million-5000.txt"
         )
-        rate_limit = cfg.get("rate_limit", 20)
+        c = constraints or {}
+        rate_limit = c.get("rate_limit_rps") or cfg.get("rate_limit", 20)
 
         if not Path(wordlist).exists():
             log.warning(f"[vhost] Wordlist not found: {wordlist}")
             return set()
 
-        roe_cfg = get_config().get("intigriti", {})
-        user_agent = roe_cfg.get("user_agent", "Mozilla/5.0")
-        roe_header = roe_cfg.get("request_header", "")
+        user_agent = c.get("required_user_agent") or "Mozilla/5.0"
 
         # Get baseline response size to filter false positives
         baseline_size = self._get_baseline_size(target_url, apex)
@@ -121,8 +125,8 @@ class VhostDiscoveryWorker(BaseWorker):
                 "-s",  # Silent mode
             ]
 
-            if roe_header:
-                cmd.extend(["-H", roe_header])
+            for name, value in (c.get("required_headers") or {}).items():
+                cmd.extend(["-H", f"{name}: {value}"])
 
             # Filter by baseline size to remove false positives
             if baseline_size is not None:

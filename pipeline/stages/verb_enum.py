@@ -87,13 +87,15 @@ class VerbEnumWorker(BaseWorker):
         if not _is_high_value(url, source_status):
             return []
 
-        roe = self.get_program_roe(program_id)
-        rate_limit = roe.get("max_rate", 20)
+        constraints = self.roe_constraints(data)
+        if not self.is_scanning_allowed(constraints, "verb_enum"):
+            return []
+        rate_limit = constraints["rate_limit_rps"]
 
         log.info(f"[verb_enum] Testing {url}")
 
         with active_scan_slot(program_id):
-            method_results = _probe_all_methods(url, rate_limit=rate_limit)
+            method_results = _probe_all_methods(url, rate_limit=rate_limit, constraints=constraints)
 
         if not method_results:
             return []
@@ -107,12 +109,10 @@ class VerbEnumWorker(BaseWorker):
         )
 
 
-def _probe_all_methods(url: str, rate_limit: int = 20) -> dict:
+def _probe_all_methods(url: str, rate_limit: int = 20, constraints: dict = None) -> dict:
     """Probe URL with all HTTP methods. Returns {method: {status, length}} dict."""
-    cfg = get_config()
-    inti_cfg = cfg.get("intigriti", {})
-    ua = inti_cfg.get("user_agent", "Mozilla/5.0")
-    req_header = inti_cfg.get("request_header", "")
+    c = constraints or {}
+    ua = c.get("required_user_agent") or "Mozilla/5.0"
 
     results = {}
     for method in _METHODS:
@@ -128,8 +128,8 @@ def _probe_all_methods(url: str, rate_limit: int = 20) -> dict:
             "-rl", str(rate_limit),
             "-H", f"User-Agent: {ua}",
         ]
-        if req_header:
-            cmd.extend(["-H", req_header])
+        for name, value in (c.get("required_headers") or {}).items():
+            cmd.extend(["-H", f"{name}: {value}"])
 
         try:
             out = subprocess.run(

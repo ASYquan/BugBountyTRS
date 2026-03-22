@@ -37,8 +37,10 @@ class CrawlerWorker(BaseWorker):
 
         log.info(f"[crawler] Crawling {url}")
 
-        roe = self.get_program_roe(program_id)
-        discovered = self._run_katana(url, roe=roe)
+        constraints = self.roe_constraints(data)
+        if not self.is_scanning_allowed(constraints, "crawler"):
+            return []
+        discovered = self._run_katana(url, constraints=constraints)
 
         results = []
         js_files = []
@@ -105,15 +107,13 @@ class CrawlerWorker(BaseWorker):
         log.info(f"[crawler] Found {len(discovered)} URLs, {len(js_files)} JS files from {url}")
         return results
 
-    def _run_katana(self, target: str, roe: dict = None) -> list[str]:
+    def _run_katana(self, target: str, constraints: dict = None) -> list[str]:
         cfg = get_config()["tools"].get("katana", {})
-        inti_cfg = get_config().get("intigriti", {})
-        roe = roe or {}
-        # Per-program RoE can reduce crawl depth ("no more data than needed for PoC")
-        depth = roe.get("max_crawl_depth") or cfg.get("depth", 3)
+        c = constraints or {}
+        depth = c.get("max_crawl_depth") or cfg.get("depth", 3)
         threads = cfg.get("threads", 10)
         timeout = cfg.get("timeout", 15)
-        rate_limit = roe.get("max_rps") or cfg.get("rate_limit", 20)
+        rate_limit = c.get("rate_limit_rps") or cfg.get("rate_limit", 20)
 
         cmd = [
             "katana",
@@ -128,13 +128,9 @@ class CrawlerWorker(BaseWorker):
             "-ef", "css,png,jpg,jpeg,gif,svg,ico,woff,woff2,ttf,eot",
         ]
 
-        # Inject Intigriti RoE-required headers
-        ua = inti_cfg.get("user_agent")
-        if ua:
-            cmd.extend(["-H", f"User-Agent: {ua}"])
-        req_header = inti_cfg.get("request_header")
-        if req_header:
-            cmd.extend(["-H", req_header])
+        # Inject RoE-required headers and user-agent
+        for h_arg in self.roe_header_args(c):
+            cmd.append(h_arg)
 
         try:
             with active_scan_slot(f"katana:{target}"):

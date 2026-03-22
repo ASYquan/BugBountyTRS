@@ -44,9 +44,11 @@ class ContentDiscoveryWorker(BaseWorker):
         if not cfg.get("enabled", True):
             return []
 
-        # Per-program RoE: responsible disclosure programs often prohibit
-        # recursive bruteforcing ("no more data than required for PoC")
-        roe = self.get_program_roe(program_id)
+        # Per-program RoE: check automated scanning policy
+        constraints = self.roe_constraints(data)
+        if not self.is_scanning_allowed(constraints, "content_discovery"):
+            return []
+        roe = constraints  # keep roe alias for content_discovery_enabled check below
         if not roe.get("content_discovery_enabled", True):
             log.info(f"[content] Skipping {url} — disabled by program RoE")
             return []
@@ -68,7 +70,7 @@ class ContentDiscoveryWorker(BaseWorker):
             return []
 
         with active_scan_slot("feroxbuster"):
-            results = self._run_feroxbuster(url, wordlist, cfg)
+            results = self._run_feroxbuster(url, wordlist, cfg, constraints=constraints)
 
         for path_url in results:
             # Store URL in DB
@@ -91,16 +93,15 @@ class ContentDiscoveryWorker(BaseWorker):
         log.info(f"[content] feroxbuster found {len(discovered)} paths on {url}")
         return discovered
 
-    def _run_feroxbuster(self, url: str, wordlist: str, cfg: dict) -> set[str]:
+    def _run_feroxbuster(self, url: str, wordlist: str, cfg: dict,
+                         constraints: dict = None) -> set[str]:
         threads = cfg.get("threads", 10)
-        rate_limit = cfg.get("rate_limit", 20)
+        c = constraints or {}
+        rate_limit = c.get("rate_limit_rps") or cfg.get("rate_limit", 20)
         scan_limit = cfg.get("scan_limit", 3)
         filter_status = cfg.get("filter_status", "404,400,503")
         extensions = cfg.get("extensions", [])
-
-        roe_cfg = get_config().get("intigriti", {})
-        user_agent = roe_cfg.get("user_agent", "Mozilla/5.0")
-        roe_header = roe_cfg.get("request_header", "")
+        user_agent = c.get("required_user_agent") or "Mozilla/5.0"
 
         try:
             with tempfile.NamedTemporaryFile(
@@ -125,9 +126,8 @@ class ContentDiscoveryWorker(BaseWorker):
                 "--user-agent", user_agent,
             ]
 
-            if roe_header:
-                key, _, val = roe_header.partition(": ")
-                cmd.extend(["-H", f"{key}: {val}"])
+            for name, value in (c.get("required_headers") or {}).items():
+                cmd.extend(["-H", f"{name}: {value}"])
 
             if filter_status:
                 cmd.extend(["--filter-status", filter_status])

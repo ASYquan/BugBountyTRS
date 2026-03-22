@@ -38,8 +38,10 @@ class NucleiScanWorker(BaseWorker):
 
         log.info(f"[nuclei] Scanning {url}")
 
-        roe = self.get_program_roe(program_id)
-        findings = self._run_nuclei(url, tech, roe=roe)
+        constraints = self.roe_constraints(data)
+        if not self.is_scanning_allowed(constraints, "nuclei"):
+            return []
+        findings = self._run_nuclei(url, tech, constraints=constraints)
 
         results = []
         for finding in findings:
@@ -72,13 +74,12 @@ class NucleiScanWorker(BaseWorker):
         log.info(f"[nuclei] Found {len(findings)} issues on {url}")
         return results
 
-    def _run_nuclei(self, target: str, tech: list = None, roe: dict = None) -> list[dict]:
+    def _run_nuclei(self, target: str, tech: list = None, constraints: dict = None) -> list[dict]:
         cfg = get_config()["tools"].get("nuclei", {})
-        inti_cfg = get_config().get("intigriti", {})
-        roe = roe or {}
+        c = constraints or {}
         threads = cfg.get("threads", 5)
-        # Per-program rate limit overrides global config
-        rate_limit = roe.get("max_rps") or cfg.get("rate_limit", 20)
+        rate_limit = c.get("rate_limit_rps") or cfg.get("rate_limit", 20)
+        roe = c  # keep roe alias for excluded_vuln_tags below
         severity = cfg.get("severity", "low,medium,high,critical")
 
         # Build tag filters based on detected tech
@@ -125,13 +126,9 @@ class NucleiScanWorker(BaseWorker):
                 "-stats", "-si", "60",
             ]
 
-            # Inject Intigriti RoE-required headers
-            ua = inti_cfg.get("user_agent")
-            if ua:
-                cmd.extend(["-H", f"User-Agent: {ua}"])
-            req_header = inti_cfg.get("request_header")
-            if req_header:
-                cmd.extend(["-H", req_header])
+            # Inject RoE-required headers and user-agent
+            for h_arg in self.roe_header_args(c):
+                cmd.append(h_arg)
 
             # Add tech-specific tags if detected
             if tags:

@@ -71,8 +71,11 @@ class HTTPProbeWorker(BaseWorker):
         if port not in _HTTP_PORTS_SET and service not in _HTTP_SERVICES:
             return []
 
+        constraints = self.roe_constraints(data)
+        if not self.is_scanning_allowed(constraints, "httpprobe"):
+            return []
         targets = _build_targets(domain, port, service)
-        return _probe_targets(self, targets, domain, ip, port, program, program_id, subdomain_id)
+        return _probe_targets(self, targets, domain, ip, port, program, program_id, subdomain_id, constraints)
 
 
 class HTTPDirectProbeWorker(BaseWorker):
@@ -108,7 +111,10 @@ class HTTPDirectProbeWorker(BaseWorker):
         ports = [int(p.strip()) for p in ports_str.split(",") if p.strip().isdigit()]
 
         # Run httpx once against all ports — faster than one call per port
-        results = _probe_multi_port(self, domain, ip, ports, program, program_id, subdomain_id)
+        constraints = self.roe_constraints(data)
+        if not self.is_scanning_allowed(constraints, "httpprobe_direct"):
+            return []
+        results = _probe_multi_port(self, domain, ip, ports, program, program_id, subdomain_id, constraints)
         log.info(f"[httpprobe_direct] {domain} → {len(results)} live service(s)")
         return results
 
@@ -116,13 +122,14 @@ class HTTPDirectProbeWorker(BaseWorker):
 
 # ── Shared helpers ────────────────────────────────────────────────────────────
 
-def _run_httpx_cmd(targets: list[str], extra_flags: list[str] = None) -> list[dict]:
+def _run_httpx_cmd(targets: list[str], extra_flags: list[str] = None,
+                   constraints: dict = None) -> list[dict]:
     """Run httpx against a list of targets. Returns parsed result dicts."""
     cfg = get_config()
     httpx_cfg = cfg.get("tools", {}).get("httpx", {})
-    inti_cfg = cfg.get("intigriti", {})
     timeout = httpx_cfg.get("timeout", 10)
-    rate_limit = httpx_cfg.get("rate_limit", 20)
+    c = constraints or {}
+    rate_limit = c.get("rate_limit_rps") or httpx_cfg.get("rate_limit", 20)
 
     cmd = [
         "httpx",
@@ -140,12 +147,12 @@ def _run_httpx_cmd(targets: list[str], extra_flags: list[str] = None) -> list[di
     if extra_flags:
         cmd.extend(extra_flags)
 
-    ua = inti_cfg.get("user_agent")
+    # Inject RoE-required user-agent and headers
+    ua = c.get("required_user_agent")
     if ua:
         cmd.extend(["-H", f"User-Agent: {ua}"])
-    req_header = inti_cfg.get("request_header")
-    if req_header:
-        cmd.extend(["-H", req_header])
+    for name, value in (c.get("required_headers") or {}).items():
+        cmd.extend(["-H", f"{name}: {value}"])
 
     # Feed targets via stdin for efficiency
     stdin_data = "\n".join(targets)
@@ -185,11 +192,11 @@ def _run_httpx_cmd(targets: list[str], extra_flags: list[str] = None) -> list[di
 
 
 def _probe_targets(worker, targets: list[str], domain: str, ip: str, port: int,
-                   program, program_id, subdomain_id) -> list[dict]:
+                   program, program_id, subdomain_id, constraints: dict = None) -> list[dict]:
     """Run httpx on explicit URL targets and return stream messages."""
     results = []
     with active_scan_slot(f"httpx:{domain}"):
-        probes = _run_httpx_cmd(targets)
+        probes = _run_httpx_cmd(targets, constraints=constraints)
 
     for probe in probes:
         url = probe.get("url")
@@ -229,13 +236,14 @@ def _probe_targets(worker, targets: list[str], domain: str, ip: str, port: int,
 
 
 def _probe_multi_port(worker, domain: str, ip: str, ports: list[int],
-                      program, program_id, subdomain_id) -> list[dict]:
+                      program, program_id, subdomain_id, constraints: dict = None) -> list[dict]:
     """Run httpx against a domain on multiple ports in a single call."""
     ports_str = ",".join(str(p) for p in ports)
     with active_scan_slot(f"httpx:{domain}"):
         probes = _run_httpx_cmd(
             [domain],
             extra_flags=["-ports", ports_str],
+            constraints=constraints,
         )
 
     results = []

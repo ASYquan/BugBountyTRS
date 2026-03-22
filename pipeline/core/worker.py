@@ -137,5 +137,85 @@ class BaseWorker(ABC):
             return {}
         return self.storage.get_program_roe(int(program_id))
 
+    def roe_constraints(self, data: dict) -> dict:
+        """Return normalized RoE constraints for the program in this message.
+
+        Handles both the new parse_roe_constraints() format (rate_limit_rps,
+        required_headers, required_user_agent, automated_scanning) and legacy
+        field names (max_rps, max_rate). Falls back to config intigriti
+        settings when no RoE is stored for the program.
+
+        Returned keys:
+          rate_limit_rps      - int req/sec to pass to tool --rate flags
+          automated_scanning  - "allowed" | "restricted" | "not_allowed"
+          required_headers    - dict {name: value} to inject into requests
+          required_user_agent - str or None
+          safe_harbour        - bool
+        """
+        from .config import get_config
+        program_id = data.get("program_id")
+        roe = self.storage.get_program_roe(int(program_id)) if program_id else {}
+        roe = roe or {}
+        cfg = get_config()
+        inti_cfg = cfg.get("intigriti", {})
+
+        # Rate: prefer stored RoE, fall back to config, default 20
+        rate_rps = int(
+            roe.get("rate_limit_rps")
+            or roe.get("max_rps")
+            or roe.get("max_rate")
+            or inti_cfg.get("rate_limit")
+            or 20
+        )
+
+        # Required headers: prefer stored RoE dict, fall back to config string
+        headers = dict(roe.get("required_headers") or {})
+        if not headers:
+            req_header = inti_cfg.get("request_header", "")
+            if req_header:
+                k, _, v = req_header.partition(": ")
+                if k:
+                    headers[k.strip()] = v.strip()
+
+        # User agent: prefer stored RoE, fall back to config
+        ua = (
+            roe.get("required_user_agent")
+            or roe.get("user_agent")
+            or inti_cfg.get("user_agent")
+        )
+
+        return {
+            "rate_limit_rps": rate_rps,
+            "automated_scanning": roe.get("automated_scanning", "allowed"),
+            "required_headers": headers,
+            "required_user_agent": ua,
+            "safe_harbour": roe.get("safe_harbour", True),
+            "intigriti_me_required": roe.get("intigriti_me_required", False),
+        }
+
+    def roe_header_args(self, constraints: dict) -> list[str]:
+        """Return list of ['-H', 'Name: Value', ...] args from RoE constraints."""
+        args = []
+        ua = constraints.get("required_user_agent")
+        if ua:
+            args.extend(["-H", f"User-Agent: {ua}"])
+        for name, value in (constraints.get("required_headers") or {}).items():
+            args.extend(["-H", f"{name}: {value}"])
+        return args
+
+    def is_scanning_allowed(self, constraints: dict, worker_name: str = None) -> bool:
+        """Return False if RoE prohibits automated scanning for this program."""
+        stance = constraints.get("automated_scanning", "allowed")
+        if stance == "not_allowed":
+            label = worker_name or self.name
+            log.warning(
+                f"[{label}] RoE prohibits automated scanning for this program — skipping"
+            )
+            return False
+        if stance == "restricted":
+            label = worker_name or self.name
+            log.info(f"[{label}] RoE restricts automated scanning — proceeding with care")
+        return True
+
     def stop(self):
         self._running = False

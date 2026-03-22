@@ -8,6 +8,7 @@
 Results are merged and deduplicated before publishing.
 """
 
+import contextlib
 import subprocess
 import json
 import xml.etree.ElementTree as ET
@@ -50,9 +51,11 @@ class PortScanWorker(BaseWorker):
 
         log.info(f"[portscan] Scanning {ip} ({domain})")
 
+        constraints = self.roe_constraints(data)
         cfg = get_config()["tools"]
         scan_cfg = cfg.get("portscan", {})
         tiers = scan_cfg.get("tiers", ["smap", "naabu", "nmap"])
+        rate_rps = constraints["rate_limit_rps"]
 
         # Collect ports from each tier
         all_ports = {}  # port -> port_info dict
@@ -64,12 +67,14 @@ class PortScanWorker(BaseWorker):
                 all_ports[p["port"]] = p
             log.info(f"[portscan] smap (passive): {len(smap_ports)} ports on {ip}")
 
-        # Tiers 2 & 3: active — acquire global scan slot first
-        with active_scan_slot(f"portscan:{ip}"):
+        # Tiers 2 & 3: active — check RoE first, then acquire global scan slot
+        active_allowed = self.is_scanning_allowed(constraints, "portscan")
+
+        with active_scan_slot(f"portscan:{ip}") if active_allowed else contextlib.nullcontext():
             # Tier 2: naabu (active fast SYN scan)
             if "naabu" in tiers:
                 naabu_cfg = cfg.get("naabu", {})
-                naabu_ports = self._run_naabu(ip, naabu_cfg)
+                naabu_ports = self._run_naabu(ip, naabu_cfg, rate_rps=rate_rps)
                 for p in naabu_ports:
                     if p["port"] not in all_ports:
                         all_ports[p["port"]] = p
@@ -79,7 +84,7 @@ class PortScanWorker(BaseWorker):
             if "nmap" in tiers and all_ports:
                 nmap_cfg = cfg.get("nmap", {})
                 port_list = ",".join(str(p) for p in sorted(all_ports.keys()))
-                nmap_ports = self._run_nmap(ip, port_list, nmap_cfg)
+                nmap_ports = self._run_nmap(ip, port_list, nmap_cfg, rate_rps=rate_rps)
                 # Nmap enriches with service/version info
                 for p in nmap_ports:
                     existing = all_ports.get(p["port"], {})
@@ -90,7 +95,7 @@ class PortScanWorker(BaseWorker):
             elif "nmap" in tiers and not all_ports:
                 # Fallback: no ports from smap/naabu, run nmap top-ports
                 nmap_cfg = cfg.get("nmap", {})
-                nmap_ports = self._run_nmap_topports(ip, nmap_cfg)
+                nmap_ports = self._run_nmap_topports(ip, nmap_cfg, rate_rps=rate_rps)
                 for p in nmap_ports:
                     all_ports[p["port"]] = p
                 log.info(f"[portscan] nmap (fallback top-ports): {len(nmap_ports)} ports on {ip}")
@@ -226,10 +231,10 @@ class PortScanWorker(BaseWorker):
 
     # ─── Tier 2: naabu (active fast SYN scan) ────────────────────
 
-    def _run_naabu(self, target: str, cfg: dict) -> list[dict]:
+    def _run_naabu(self, target: str, cfg: dict, rate_rps: int = 20) -> list[dict]:
         """Fast port discovery with naabu. SYN scan if root, CONNECT otherwise."""
         ports = []
-        rate = cfg.get("rate", 20)
+        rate = rate_rps or cfg.get("rate", 20)
         threads = cfg.get("threads", 5)
         top_ports = cfg.get("top_ports", 1000)
         exclude_cdn = cfg.get("exclude_cdn", True)
@@ -285,9 +290,9 @@ class PortScanWorker(BaseWorker):
 
     # ─── Tier 3: nmap (deep — targeted ports only) ───────────────
 
-    def _run_nmap(self, target: str, port_list: str, cfg: dict) -> list[dict]:
+    def _run_nmap(self, target: str, port_list: str, cfg: dict, rate_rps: int = 20) -> list[dict]:
         """Run nmap service detection only on known-open ports."""
-        rate = cfg.get("rate", 20)
+        rate = rate_rps or cfg.get("rate", 20)
         scripts = cfg.get("scripts", "default,safe")
 
         with tempfile.NamedTemporaryFile(suffix=".xml", delete=False) as tmp:
@@ -314,10 +319,10 @@ class PortScanWorker(BaseWorker):
         finally:
             Path(xml_path).unlink(missing_ok=True)
 
-    def _run_nmap_topports(self, target: str, cfg: dict) -> list[dict]:
+    def _run_nmap_topports(self, target: str, cfg: dict, rate_rps: int = 20) -> list[dict]:
         """Fallback: run nmap top-ports when no ports found by other tiers."""
         top_ports = cfg.get("top_ports", 1000)
-        rate = cfg.get("rate", 20)
+        rate = rate_rps or cfg.get("rate", 20)
 
         with tempfile.NamedTemporaryFile(suffix=".xml", delete=False) as tmp:
             xml_path = tmp.name

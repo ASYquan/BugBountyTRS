@@ -136,6 +136,10 @@ class TakeoverCheckWorker(BaseWorker):
             tmp.write("\n".join(domains))
             hosts_file = tmp.name
 
+        constraints = self.roe_constraints(batch[0]) if batch else {}
+        if not self.is_scanning_allowed(constraints, "takeover_check"):
+            return []
+
         try:
             with active_scan_slot("takeover"):
                 if cfg.get("use_subzy", True):
@@ -143,7 +147,8 @@ class TakeoverCheckWorker(BaseWorker):
                     findings.extend(subzy_findings)
 
                 if cfg.get("use_nuclei", True):
-                    nuclei_findings = self._run_nuclei_takeover(hosts_file, program, program_id)
+                    nuclei_findings = self._run_nuclei_takeover(hosts_file, program, program_id,
+                                                                constraints=constraints)
                     findings.extend(nuclei_findings)
         finally:
             Path(hosts_file).unlink(missing_ok=True)
@@ -205,11 +210,6 @@ class TakeoverCheckWorker(BaseWorker):
         For unknown services (no fingerprint in _TAKEOVER_FINGERPRINTS), we return True to
         preserve the finding — better a FP than a missed takeover on an obscure service.
         """
-        cfg = get_config()
-        inti_cfg = cfg.get("intigriti", {})
-        ua = inti_cfg.get("user_agent", "Mozilla/5.0")
-        req_header = inti_cfg.get("request_header", "")
-
         # Normalise service name for lookup
         service_key = service.lower().strip()
 
@@ -224,10 +224,7 @@ class TakeoverCheckWorker(BaseWorker):
             log.debug(f"[takeover] No fingerprint for service '{service}', keeping finding")
             return True, None
 
-        headers = {"User-Agent": ua}
-        if req_header and ":" in req_header:
-            k, v = req_header.split(":", 1)
-            headers[k.strip()] = v.strip()
+        headers = {"User-Agent": "Mozilla/5.0"}
 
         for scheme in ("https", "http"):
             try:
@@ -307,12 +304,13 @@ class TakeoverCheckWorker(BaseWorker):
             log.warning(f"[takeover] subzy failed: {e}")
             return []
 
-    def _run_nuclei_takeover(self, hosts_file: str, program: str, program_id: int) -> list[dict]:
+    def _run_nuclei_takeover(self, hosts_file: str, program: str, program_id: int,
+                             constraints: dict = None) -> list[dict]:
         """Run nuclei takeover templates for confirmation."""
         import subprocess
 
-        roe_cfg = get_config().get("intigriti", {})
-        roe_header = roe_cfg.get("request_header", "")
+        c = constraints or {}
+        rate_limit = c.get("rate_limit_rps") or 20
 
         cmd = [
             "nuclei",
@@ -320,11 +318,14 @@ class TakeoverCheckWorker(BaseWorker):
             "-t", "takeover/",
             "-jsonl",
             "-silent",
-            "-rate-limit", "20",
+            "-rate-limit", str(rate_limit),
             "-c", "5",
         ]
-        if roe_header:
-            cmd.extend(["-H", roe_header])
+        ua = c.get("required_user_agent")
+        if ua:
+            cmd.extend(["-H", f"User-Agent: {ua}"])
+        for name, value in (c.get("required_headers") or {}).items():
+            cmd.extend(["-H", f"{name}: {value}"])
 
         try:
             result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
