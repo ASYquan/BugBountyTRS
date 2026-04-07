@@ -4,6 +4,7 @@ Continuous attack surface mapping pipeline for bug bounty. Redis Streams event b
 
 Built on ideas from Erlend Leiknes (Mneomonic) TRS presentation , Jason Haddix's TBHM/Modern Recon methodology, and the Brzozowski automation blog.
 
+This repo is currently outdated. Updated version is currently private, due to API-keys and undisclosed information from Private Bug Bounty Programs. The tech stack and methodology is still the same.
 ## Architecture
 
 ```
