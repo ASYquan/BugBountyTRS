@@ -2,7 +2,7 @@
 
 Continuous attack surface mapping pipeline for bug bounty. Redis Streams event bus, SQLite storage, stateless Python workers. Runs 24/7 and keeps accumulating structured recon data you can dig into manually.
 
-Built on ideas from Erlend Leiknes's TRS presentation, Jason Haddix's TBHM/Modern Recon methodology, and the Brzozowski automation blog.
+Built on ideas from Erlend Leiknes (Mneomonic) TRS presentation , Jason Haddix's TBHM/Modern Recon methodology, and the Brzozowski automation blog.
 
 ## Architecture
 
